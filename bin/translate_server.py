@@ -167,6 +167,7 @@ def ollama_generate(url, model, prompt):
                 "temperature": 0.1,
                 "num_predict": 250,
             },
+            "keep_alive": -1,
         },
         ensure_ascii=False,
     ).encode("utf-8")
