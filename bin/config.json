@@ -1,0 +1,22 @@
+{
+  "auto_detect": true,
+  "target_object": null,
+  "source": {
+    "width": 1920,
+    "height": 1080
+  },
+  "crop_stage": "save",
+  "crop": {},
+  "roi": {
+    "x_pct": 18.75,
+    "y_pct": 57.4,
+    "width_pct": 64.6,
+    "height_pct": 38.9
+  },
+  "diff_roi": {
+    "x_pct": 22.9,
+    "y_pct": 71.3,
+    "width_pct": 46.9,
+    "height_pct": 17.6
+  }
+}

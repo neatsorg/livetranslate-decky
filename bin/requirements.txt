@@ -1,0 +1,2 @@
+# PyGObject is usually provided by the OS on SteamOS/Arch, not pip.
+# Install with pacman/SteamOS packages if gi.repository is missing.

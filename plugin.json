@@ -1,0 +1,10 @@
+{
+  "name": "PlayTranslate",
+  "author": "playtranslate-deck",
+  "flags": ["debug"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["translation", "overlay", "gamescope"],
+    "description": "Decky control panel for the PlayTranslate capture engine."
+  }
+}

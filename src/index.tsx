@@ -1,0 +1,523 @@
+import {
+  ButtonItem,
+  PanelSection,
+  PanelSectionRow,
+  findModuleChild,
+  staticClasses,
+} from "@decky/ui";
+import { callable, definePlugin, routerHook } from "@decky/api";
+import { useEffect, useRef, useState } from "react";
+import { FaLanguage } from "react-icons/fa";
+
+type CaptureStatus = {
+  running: boolean;
+  pid: number | null;
+  returncode: number | null;
+  engine_dir: string | null;
+  capture_py: string | null;
+  log_path: string;
+  log_tail: string;
+  translation_path: string;
+  translation: string;
+  translation_error?: string;
+  translate_url?: string;
+  translation_worker?: boolean;
+  translation_in_progress?: boolean;
+  last_settled_mtime_ns?: number | null;
+  last_translated_image_mtime_ns?: number | null;
+  translation_stale?: boolean;
+  error?: string;
+};
+
+type AiServerStatus = {
+  ok: boolean;
+  url: string;
+  status?: number;
+  body?: string;
+  error?: string;
+};
+
+type HidrawTestResult = {
+  success: boolean;
+  device?: string;
+  buttons: string[];
+  error?: string;
+};
+
+const startCapture = callable<[], CaptureStatus>("start_capture");
+const stopCapture = callable<[], CaptureStatus>("stop_capture");
+const getStatus = callable<[], CaptureStatus>("status");
+const translateLatest = callable<[], CaptureStatus>("translate_latest");
+const testHidrawButtonState = callable<[], HidrawTestResult>("test_hidraw_button_state");
+const checkAiServer = callable<[], AiServerStatus>("check_ai_server");
+
+function startHotkeyPolling() {
+  let hotkeyBusy = false;
+  let pollingInput = false;
+  let holdStart: number | null = null;
+  let showTriggeredForPress = false;
+  let l4WasPressed = false;
+  let hudVisible = false;
+
+  const showHud = (text: string) => {
+    hudVisible = true;
+    window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text } }));
+  };
+
+  const hideHud = () => {
+    hudVisible = false;
+    window.dispatchEvent(new CustomEvent("playtranslate-hide-hud"));
+  };
+
+  const handleHudVisible = () => {
+    hudVisible = true;
+  };
+  const handleHudHidden = () => {
+    hudVisible = false;
+  };
+  window.addEventListener("playtranslate-hud-visible", handleHudVisible);
+  window.addEventListener("playtranslate-hud-hidden", handleHudHidden);
+
+  const timer = window.setInterval(async () => {
+    if (hotkeyBusy || pollingInput) {
+      return;
+    }
+
+    pollingInput = true;
+    try {
+      const result = await testHidrawButtonState();
+      if (!result.success) {
+        holdStart = null;
+        showTriggeredForPress = false;
+        return;
+      }
+
+      const l4Pressed = result.buttons.includes("L4");
+      if (!l4Pressed) {
+        holdStart = null;
+        showTriggeredForPress = false;
+        l4WasPressed = false;
+        return;
+      }
+
+      const isNewPress = !l4WasPressed;
+      l4WasPressed = true;
+      if (isNewPress && hudVisible) {
+        hideHud();
+        showTriggeredForPress = true;
+        return;
+      }
+
+      const now = Date.now();
+      if (holdStart === null) {
+        holdStart = now;
+        return;
+      }
+
+      if (showTriggeredForPress || now - holdStart < 600) {
+        return;
+      }
+
+      showTriggeredForPress = true;
+      hotkeyBusy = true;
+      try {
+        const next = await getStatus();
+        if (!next.error && next.translation && !next.translation_stale) {
+          showHud(next.translation);
+        } else if (!next.error && next.running && !next.translation_in_progress) {
+          const translated = await translateLatest();
+          if (!translated.error && translated.translation && !translated.translation_stale) {
+            showHud(translated.translation);
+          }
+        }
+      } finally {
+        hotkeyBusy = false;
+      }
+    } catch {
+      holdStart = null;
+      showTriggeredForPress = false;
+    } finally {
+      pollingInput = false;
+    }
+  }, 150);
+
+  return () => {
+    window.clearInterval(timer);
+    window.removeEventListener("playtranslate-hud-visible", handleHudVisible);
+    window.removeEventListener("playtranslate-hud-hidden", handleHudHidden);
+  };
+}
+
+enum UIComposition {
+  Notification = 1,
+  Overlay = 2,
+}
+
+const useUIComposition: (composition: UIComposition) => void = findModuleChild((m) => {
+  if (typeof m !== "object") return undefined;
+  for (const prop in m) {
+    const fn = (m as Record<string, unknown>)[prop];
+    if (
+      typeof fn === "function" &&
+      fn.toString().includes("AddMinimumCompositionStateRequest") &&
+      fn.toString().includes("ChangeMinimumCompositionStateRequest") &&
+      fn.toString().includes("RemoveMinimumCompositionStateRequest") &&
+      !fn.toString().includes("m_mapCompositionStateRequests")
+    ) {
+      return fn;
+    }
+  }
+  return undefined;
+});
+
+function CompositionRequest({ level }: { level: UIComposition }) {
+  useUIComposition(level);
+  return null;
+}
+
+function SubtitleHud({
+  visible,
+  text,
+}: {
+  visible: boolean;
+  text: string;
+}) {
+  if (!visible || !text.trim()) {
+    return null;
+  }
+
+  return (
+    <>
+      <CompositionRequest level={UIComposition.Notification} />
+      <div
+        style={{
+          position: "fixed",
+          left: 0,
+          right: 0,
+          bottom: "7vh",
+          zIndex: 8003,
+          pointerEvents: "none",
+          display: "flex",
+          justifyContent: "center",
+          padding: "0 7vw",
+          boxSizing: "border-box",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: "1100px",
+            padding: "14px 22px",
+            borderRadius: "8px",
+            background: "rgba(8, 10, 12, 0.84)",
+            color: "#f7f4ee",
+            fontSize: "26px",
+            lineHeight: "34px",
+            fontWeight: 600,
+            textAlign: "center",
+            textShadow: "0 2px 3px rgba(0, 0, 0, 0.85)",
+            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.45)",
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {text}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function GlobalHud() {
+  const [visible, setVisible] = useState(false);
+  const [translation, setTranslation] = useState("");
+  const hudTimerRef = useRef<number | null>(null);
+  const visibleRef = useRef(false);
+
+  const releaseFocus = () => {
+    window.setTimeout(() => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) {
+        active.blur();
+      }
+    }, 0);
+    window.setTimeout(() => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) {
+        active.blur();
+      }
+    }, 120);
+  };
+
+  const showHud = (text: string, durationMs = 6000) => {
+    if (!text.trim()) {
+      return;
+    }
+    setTranslation(text.trim());
+    visibleRef.current = true;
+    window.dispatchEvent(new CustomEvent("playtranslate-hud-visible"));
+    setVisible(true);
+    if (hudTimerRef.current !== null) {
+      window.clearTimeout(hudTimerRef.current);
+    }
+    hudTimerRef.current = window.setTimeout(() => {
+      visibleRef.current = false;
+      window.dispatchEvent(new CustomEvent("playtranslate-hud-hidden"));
+      setVisible(false);
+      hudTimerRef.current = null;
+    }, durationMs);
+    releaseFocus();
+  };
+
+  const hideHud = () => {
+    visibleRef.current = false;
+    window.dispatchEvent(new CustomEvent("playtranslate-hud-hidden"));
+    setVisible(false);
+    if (hudTimerRef.current !== null) {
+      window.clearTimeout(hudTimerRef.current);
+      hudTimerRef.current = null;
+    }
+    releaseFocus();
+  };
+
+  useEffect(() => {
+    const handleShow = (event: Event) => {
+      const detail = (event as CustomEvent<{ text?: string }>).detail;
+      showHud(detail?.text ?? "");
+    };
+    const handleHide = () => {
+      hideHud();
+    };
+
+    window.addEventListener("playtranslate-show-hud", handleShow);
+    window.addEventListener("playtranslate-hide-hud", handleHide);
+    return () => {
+      window.removeEventListener("playtranslate-show-hud", handleShow);
+      window.removeEventListener("playtranslate-hide-hud", handleHide);
+    };
+  }, []);
+
+  return <SubtitleHud visible={visible} text={translation} />;
+}
+
+function Content() {
+  const [status, setStatus] = useState<CaptureStatus | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [inputTest, setInputTest] = useState<string>("not tested");
+  const [aiStatus, setAiStatus] = useState<string>("not checked");
+  const [hudVisible, setHudVisible] = useState(false);
+  const hudTimerRef = useRef<number | null>(null);
+
+  const refresh = async () => {
+    const next = await getStatus();
+    setStatus(next);
+  };
+
+  const runAction = async (action: () => Promise<CaptureStatus>, title: string) => {
+    setBusy(true);
+    try {
+      const next = await action();
+      setStatus(next);
+      if (next.error) {
+        console.warn(`${title}: ${next.error}`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runInputTest = async () => {
+    setBusy(true);
+    setInputTest("testing...");
+    try {
+      const result = await testHidrawButtonState();
+      if (!result.success) {
+        setInputTest(`error: ${result.error ?? "unknown"}`);
+      } else if (result.buttons.length === 0) {
+        setInputTest(`no buttons (${result.device ?? "device unknown"})`);
+      } else {
+        setInputTest(`${result.buttons.join(", ")} (${result.device ?? "device unknown"})`);
+      }
+    } catch (error) {
+      setInputTest(`error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runAiServerTest = async () => {
+    setBusy(true);
+    setAiStatus("checking...");
+    try {
+      const result = await checkAiServer();
+      if (result.ok) {
+        setAiStatus(`ok: ${result.url}`);
+      } else {
+        setAiStatus(`error: ${result.error ?? result.url}`);
+      }
+    } catch (error) {
+      setAiStatus(`error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const showHud = (durationMs = 9000) => {
+    const text = status?.translation?.trim() ?? "";
+    window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text } }));
+    setHudVisible(true);
+    if (hudTimerRef.current !== null) {
+      window.clearTimeout(hudTimerRef.current);
+    }
+    hudTimerRef.current = window.setTimeout(() => {
+      setHudVisible(false);
+      hudTimerRef.current = null;
+    }, durationMs);
+  };
+
+  const hideHud = () => {
+    window.dispatchEvent(new CustomEvent("playtranslate-hide-hud"));
+    setHudVisible(false);
+    if (hudTimerRef.current !== null) {
+      window.clearTimeout(hudTimerRef.current);
+      hudTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (hudTimerRef.current !== null) {
+        window.clearTimeout(hudTimerRef.current);
+      }
+    };
+  }, []);
+
+  const stateText = status?.running
+    ? `Running${status.pid ? ` (${status.pid})` : ""}`
+    : "Stopped";
+
+  return (
+    <>
+    <PanelSection title="PlayTranslate">
+      <PanelSectionRow>
+        <div>{stateText}</div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy || status?.running === true}
+          layout="below"
+          onClick={() => runAction(startCapture, "PlayTranslate started")}
+        >
+          Start Capture
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy || status?.running !== true}
+          layout="below"
+          onClick={() => runAction(stopCapture, "PlayTranslate stopped")}
+        >
+          Stop Capture
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={busy} layout="below" onClick={refresh}>
+          Refresh Status
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy}
+          layout="below"
+          onClick={() => runAction(translateLatest, "PlayTranslate translated")}
+        >
+          Translate Latest
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={busy} layout="below" onClick={runInputTest}>
+          Test L4 Input
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={busy} layout="below" onClick={runAiServerTest}>
+          Test AI Server
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={!status?.translation} layout="below" onClick={() => showHud()}>
+          Show HUD
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={!hudVisible} layout="below" onClick={hideHud}>
+          Hide HUD
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "12px", opacity: 0.8, overflowWrap: "anywhere" }}>
+          <div>Engine: {status?.engine_dir ?? "not found"}</div>
+          <div>Log: {status?.log_path ?? "-"}</div>
+          <div>Translation: {status?.translation_path ?? "-"}</div>
+          <div>AI URL: {status?.translate_url ?? "-"}</div>
+          <div>AI: {aiStatus}</div>
+          <div>
+            Worker: {status?.translation_worker ? (status.translation_in_progress ? "translating" : "running") : "stopped"}
+            {status?.translation_stale ? " / stale" : ""}
+          </div>
+          <div>Input: {inputTest}</div>
+          <div>HUD: {hudVisible ? "visible" : "hidden"}</div>
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <pre
+          style={{
+            maxHeight: "160px",
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            fontSize: "14px",
+            lineHeight: "18px",
+          }}
+        >
+          {status?.translation || status?.translation_error || ""}
+        </pre>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <pre
+          style={{
+            maxHeight: "220px",
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            fontSize: "11px",
+            lineHeight: "14px",
+          }}
+        >
+          {status?.error ?? status?.log_tail ?? ""}
+        </pre>
+      </PanelSectionRow>
+    </PanelSection>
+    </>
+  );
+}
+
+export default definePlugin(() => {
+  const stopHotkeyPolling = startHotkeyPolling();
+  routerHook.addGlobalComponent("PlayTranslateHud", () => <GlobalHud />);
+
+  return {
+    name: "PlayTranslate",
+    titleView: <div className={staticClasses.Title}>PlayTranslate</div>,
+    content: <Content />,
+    icon: <FaLanguage />,
+    onDismount() {
+      stopHotkeyPolling();
+      routerHook.removeGlobalComponent("PlayTranslateHud");
+    },
+    alwaysRender: true,
+  };
+});
