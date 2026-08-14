@@ -21,6 +21,8 @@ class Plugin:
         self.translation_worker_running = False
         self.translation_in_progress = False
         self.last_translated_image_mtime_ns = None
+        self.ocr_worker_process = None
+        self.ocr_worker_log_file = None
         self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = Path(getattr(decky, "DECKY_PLUGIN_DIR", self.plugin_dir)).parent.parent / "data" / "PlayTranslate"
         self.log_path = self.data_dir / "playtranslate-capture.log"
@@ -61,8 +63,8 @@ class Plugin:
     def _is_running(self):
         return self.process is not None and self.process.poll() is None
 
-    def _find_capture_processes(self, capture_py):
-        capture_path = str(capture_py)
+    def _find_processes_by_script(self, script_path):
+        script_path = str(script_path)
         pids = []
         current_pid = os.getpid()
         for proc_dir in Path("/proc").iterdir():
@@ -76,16 +78,19 @@ class Plugin:
             except OSError:
                 continue
             parts = [part for part in cmdline.split("\0") if part]
-            if capture_path in parts:
+            if script_path in parts:
                 pids.append(pid)
         return pids
 
-    async def _stop_existing_capture_processes(self, capture_py):
-        pids = self._find_capture_processes(capture_py)
+    def _find_capture_processes(self, capture_py):
+        return self._find_processes_by_script(capture_py)
+
+    async def _stop_processes_by_script(self, script_path, label):
+        pids = self._find_processes_by_script(script_path)
         if not pids:
             return
 
-        decky.logger.info(f"Stopping existing PlayTranslate capture processes: {pids}")
+        decky.logger.info(f"Stopping existing PlayTranslate {label} processes: {pids}")
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -94,14 +99,17 @@ class Plugin:
 
         for _ in range(20):
             await asyncio.sleep(0.1)
-            if not self._find_capture_processes(capture_py):
+            if not self._find_processes_by_script(script_path):
                 return
 
-        for pid in self._find_capture_processes(capture_py):
+        for pid in self._find_processes_by_script(script_path):
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+    async def _stop_existing_capture_processes(self, capture_py):
+        await self._stop_processes_by_script(capture_py, "capture")
 
     def _tail_log(self, lines=40):
         if not self.log_path.exists():
@@ -191,6 +199,8 @@ class Plugin:
             "translate_url": self._translate_url(),
             "translation_worker": self.translation_worker_running and worker_alive,
             "translation_in_progress": self.translation_in_progress,
+            "ocr_worker_running": self._is_ocr_worker_running(),
+            "ocr_worker_pid": self.ocr_worker_process.pid if self._is_ocr_worker_running() else None,
             "last_settled_mtime_ns": image_mtime_ns,
             "last_translated_image_mtime_ns": self.last_translated_image_mtime_ns,
             "translation_stale": (
@@ -230,6 +240,165 @@ class Plugin:
             str(script),
             *[str(arg) for arg in args],
         ]
+
+    def _ocr_worker_port(self):
+        return int(os.environ.get("PLAYTRANSLATE_OCR_WORKER_PORT", "8788"))
+
+    def _ocr_worker_health_url(self):
+        return f"http://127.0.0.1:{self._ocr_worker_port()}/health"
+
+    def _ocr_worker_translate_url(self):
+        return f"http://127.0.0.1:{self._ocr_worker_port()}/translate"
+
+    def _regions_json_path(self, engine_dir):
+        return engine_dir / "ocr_regions.enigma_of_fear.example.json"
+
+    def _is_ocr_worker_running(self):
+        return self.ocr_worker_process is not None and self.ocr_worker_process.poll() is None
+
+    async def _ocr_worker_health(self):
+        url = self._ocr_worker_health_url()
+
+        def check():
+            try:
+                with request.urlopen(url, timeout=2) as response:
+                    return 200 <= response.status < 300
+            except (urlerror.URLError, OSError):
+                return False
+
+        return await asyncio.to_thread(check)
+
+    async def check_ocr_worker(self):
+        url = self._ocr_worker_health_url()
+
+        def check():
+            try:
+                with request.urlopen(url, timeout=2) as response:
+                    body = response.read(400).decode("utf-8", errors="replace")
+                    return {"ok": 200 <= response.status < 300, "url": url, "status": response.status, "body": body}
+            except (urlerror.URLError, OSError) as exc:
+                return {"ok": False, "url": url, "error": str(exc)}
+
+        return await asyncio.to_thread(check)
+
+    async def _ensure_ocr_worker(self, engine_dir):
+        if self._is_ocr_worker_running():
+            return True
+        if await self._ocr_worker_health():
+            # A worker from a previous plugin load is already up and healthy; adopt it.
+            return True
+
+        worker_py = engine_dir / "ocr_worker.py"
+        if not worker_py.exists():
+            decky.logger.warning(f"{worker_py} was not found; staying on the per-call distrobox path")
+            return False
+
+        await self._stop_processes_by_script(worker_py, "ocr_worker")
+
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        worker_log_path = self.data_dir / "ocr-worker.log"
+        worker_log = worker_log_path.open("a", encoding="utf-8")
+        worker_log.write(f"\n--- PlayTranslate ocr_worker start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        worker_log.flush()
+
+        command = self._distrobox_python_command(worker_py, "--port", str(self._ocr_worker_port()))
+        env = self._subprocess_env()
+        try:
+            self.ocr_worker_process = subprocess.Popen(
+                command,
+                cwd=str(engine_dir),
+                stdout=worker_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            worker_log.write(f"Failed to start ocr_worker: {exc}\n")
+            worker_log.flush()
+            worker_log.close()
+            return False
+
+        self.ocr_worker_log_file = worker_log
+
+        # distrobox enter + tesseract/tesserocr init can take a few seconds on first start.
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            if await self._ocr_worker_health():
+                decky.logger.info(f"PlayTranslate OCR worker healthy pid={self.ocr_worker_process.pid}")
+                return True
+            if self.ocr_worker_process.poll() is not None:
+                break
+
+        decky.logger.warning("PlayTranslate OCR worker did not become healthy; falling back to the per-call distrobox path")
+        return False
+
+    async def _stop_ocr_worker(self):
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        worker_py = (engine_dir / "ocr_worker.py") if engine_dir else None
+
+        if self.ocr_worker_process is not None:
+            pid = self.ocr_worker_process.pid
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                for _ in range(20):
+                    if self.ocr_worker_process.poll() is not None:
+                        break
+                    await asyncio.sleep(0.1)
+                if self.ocr_worker_process.poll() is None:
+                    os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.ocr_worker_process = None
+
+        if self.ocr_worker_log_file:
+            self.ocr_worker_log_file.write(f"--- PlayTranslate ocr_worker stop {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            self.ocr_worker_log_file.close()
+            self.ocr_worker_log_file = None
+
+        if worker_py:
+            await self._stop_processes_by_script(worker_py, "ocr_worker")
+
+    def _write_translation_outputs(self, translation, full_result):
+        self.translation_path.write_text(translation.strip() + "\n", encoding="utf-8")
+        self.translation_json_path.write_text(
+            json.dumps(full_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _run_translation_via_worker(self, image_path, engine_dir):
+        payload = json.dumps(
+            {
+                "image": str(image_path),
+                "regions_json": str(self._regions_json_path(engine_dir)),
+                "http_url": self._translate_url(),
+                "target_lang": "Japanese",
+            }
+        ).encode("utf-8")
+        req = request.Request(
+            self._ocr_worker_translate_url(),
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        with request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _run_translation(self, engine_dir, image_path):
+        if self._is_ocr_worker_running():
+            try:
+                result = self._run_translation_via_worker(image_path, engine_dir)
+                translation = str(result.get("translation") or "").strip()
+                if not translation:
+                    return False, "", "ocr worker returned an empty translation"
+                self._write_translation_outputs(translation, result)
+                timing = result.get("timing")
+                if timing:
+                    self._append_translation_worker_log(f"worker timing: {json.dumps(timing, ensure_ascii=False)}")
+                return True, translation, ""
+            except (urlerror.URLError, OSError, ValueError, KeyError) as exc:
+                self._append_translation_worker_log(f"ocr worker call failed, falling back to distrobox path: {exc}")
+
+        return self._run_translation_runner(engine_dir)
 
     def _find_steamdeck_hidraw(self):
         if self.hidraw_path and self.hidraw_path.exists():
@@ -415,7 +584,7 @@ class Plugin:
                         self._append_translation_worker_log(
                             f"translate image mtime_ns={mtime_ns} {time.strftime('%Y-%m-%d %H:%M:%S')}"
                         )
-                        ok, stdout, stderr = await asyncio.to_thread(self._run_translation_runner, engine_dir)
+                        ok, stdout, stderr = await asyncio.to_thread(self._run_translation, engine_dir, image_path)
                         try:
                             current_mtime_ns = image_path.stat().st_mtime_ns
                         except OSError:
@@ -472,6 +641,7 @@ class Plugin:
         if self._is_running():
             if engine_dir:
                 self._start_translation_worker(engine_dir)
+                asyncio.create_task(self._ensure_ocr_worker(engine_dir))
             return await self.status()
 
         if not capture_py or not config_json:
@@ -529,10 +699,12 @@ class Plugin:
 
         decky.logger.info(f"Started PlayTranslate capture pid={self.process.pid}")
         self._start_translation_worker(engine_dir)
+        asyncio.create_task(self._ensure_ocr_worker(engine_dir))
         return await self.status()
 
     async def stop_capture(self):
         await self._stop_translation_worker()
+        await self._stop_ocr_worker()
         _engine_dir, capture_py, _config_json = self._find_engine()
 
         if not self._is_running():

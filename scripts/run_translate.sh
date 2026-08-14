@@ -50,13 +50,17 @@ if [[ ! -f "${OCR_SCRIPT}" || ! -f "${TRANSLATE_SCRIPT}" || ! -f "${PIPELINE_SCR
   exit 3
 fi
 
+DISTROBOX_START=$(date +%s.%N)
 TRANSLATION="$(
   distrobox enter "${OCR_BOX}" -- python3 "${PIPELINE_SCRIPT}" \
     "${IMAGE_PATH}" \
     --regions-json "${REGIONS_JSON}" \
     --http-url "${TRANSLATE_URL}" \
-    --json-output "${OUTPUT_JSON}"
+    --json-output "${OUTPUT_JSON}" \
+    2>>"${DEBUG_LOG}"
 )"
+DISTROBOX_END=$(date +%s.%N)
+DISTROBOX_ELAPSED=$(awk -v a="${DISTROBOX_START}" -v b="${DISTROBOX_END}" 'BEGIN { printf "%.3f", b - a }')
 
 printf '%s\n' "${TRANSLATION}" > "${OUTPUT_TXT}"
 rm -f "${OUTPUT_ERROR}"
@@ -64,6 +68,7 @@ rm -f "${OUTPUT_ERROR}"
 {
   echo "wrote ${OUTPUT_TXT}"
   echo "translation=${TRANSLATION}"
+  echo "timing.distrobox_enter_to_exit_s=${DISTROBOX_ELAPSED}"
 } >> "${DEBUG_LOG}"
 
 printf '%s\n' "${TRANSLATION}"
