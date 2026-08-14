@@ -177,6 +177,7 @@ class FrameCounter:
         self.caps_printed = False
         self.saved_changes = 0
         self.save_limit_reported = False
+        self.last_change_time = time.monotonic()
         self.pending_settled_save = False
         self.saved_settled = 0
 
@@ -368,6 +369,7 @@ class FrameCounter:
                 self.pending_settled_save = True
                 self.low_diff_streak = 0
                 self.next_change_frame = self.frames + self.diff_cooldown_frames
+                self.last_change_time = time.monotonic()
                 print(
                     f"change frame={self.frames} ratio={self.last_change_ratio:.4f} events={self.change_events}",
                     flush=True,
@@ -380,6 +382,20 @@ class FrameCounter:
             self.suppressed_changes += 1
 
         self.prev_signature = signature
+
+    def seconds_since_last_change(self):
+        return time.monotonic() - self.last_change_time
+
+    def reset_diff_state(self):
+        """Clear state that only makes sense against the pipeline we were
+        just reading from, after a stall-watchdog pipeline rebuild. frames/
+        change_events/etc. are left alone since they're just run totals.
+        """
+        self.prev_signature = None
+        self.diff_armed = True
+        self.low_diff_streak = 0
+        self.pending_settled_save = False
+        self.last_change_time = time.monotonic()
 
     def on_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -498,6 +514,17 @@ def main():
         default=50,
         help="Maximum number of PNGs to save per run. Use 0 for no limit.",
     )
+    parser.add_argument(
+        "--stall-timeout-s",
+        type=float,
+        default=90.0,
+        help=(
+            "If --diff is on and no change event fires for this many seconds, "
+            "rebuild the capture pipeline (this is how gamescope's PipeWire "
+            "source has been observed to silently stop delivering fresh "
+            "frames while frames/fps still look healthy). Use 0 to disable."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list_node:
@@ -509,12 +536,16 @@ def main():
     save_roi = dict(config.get("roi") or {}) if config.get("crop_stage") == "save" else None
     Gst.init(None)
 
-    pipeline_text = build_pipeline(args, config)
-    if args.print_pipeline:
-        print(pipeline_text, flush=True)
+    def start_pipeline(counter):
+        pipeline_text = build_pipeline(args, config)
+        if args.print_pipeline:
+            print(pipeline_text, flush=True)
+        pipeline = Gst.parse_launch(pipeline_text)
+        sink = pipeline.get_by_name("sink")
+        sink.connect("new-sample", counter.on_sample)
+        pipeline.set_state(Gst.State.PLAYING)
+        return pipeline, pipeline.get_bus()
 
-    pipeline = Gst.parse_launch(pipeline_text)
-    sink = pipeline.get_by_name("sink")
     counter = FrameCounter(
         args.report_interval,
         diff_enabled=args.diff,
@@ -533,17 +564,15 @@ def main():
         diff_roi=diff_roi,
         save_roi=save_roi,
     )
-    sink.connect("new-sample", counter.on_sample)
-
-    bus = pipeline.get_bus()
-    pipeline.set_state(Gst.State.PLAYING)
+    pipeline, bus = start_pipeline(counter)
     started = time.monotonic()
+    stall_watchdog_enabled = args.diff and args.stall_timeout_s > 0
 
     try:
         while True:
             msg = bus.timed_pop_filtered(
                 100 * Gst.MSECOND,
-                Gst.MessageType.ERROR | Gst.MessageType.EOS,
+                Gst.MessageType.ERROR | Gst.MessageType.EOS | Gst.MessageType.WARNING,
             )
             if msg:
                 if msg.type == Gst.MessageType.ERROR:
@@ -554,6 +583,21 @@ def main():
                     return 1
                 if msg.type == Gst.MessageType.EOS:
                     return 0
+                if msg.type == Gst.MessageType.WARNING:
+                    warn, debug = msg.parse_warning()
+                    print(f"GStreamer warning: {warn}", flush=True)
+                    if debug:
+                        print(debug, flush=True)
+
+            if stall_watchdog_enabled and counter.seconds_since_last_change() >= args.stall_timeout_s:
+                print(
+                    f"stall watchdog: no change event for {args.stall_timeout_s:.0f}s "
+                    f"(frames={counter.frames} still incrementing) - rebuilding capture pipeline",
+                    flush=True,
+                )
+                pipeline.set_state(Gst.State.NULL)
+                counter.reset_diff_state()
+                pipeline, bus = start_pipeline(counter)
 
             if args.duration and time.monotonic() - started >= args.duration:
                 return 0

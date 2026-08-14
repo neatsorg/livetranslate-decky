@@ -127,3 +127,21 @@ a tighter text-only region or raise the reset threshold:
 ```bash
 python3 capture.py --diff --diff-threshold 0.05 --diff-reset-threshold 0.03 --duration 20
 ```
+
+## Stall Watchdog
+
+gamescope's PipeWire source has been observed to silently stop delivering new
+frame content (logged on the Deck as repeated `pipewire: warning: out of
+buffers` in `journalctl`, outside this script's own log) while `frames`/`fps`
+keep incrementing normally, so nothing here looks wrong at a glance. When
+`--diff` is on, `capture.py` now rebuilds its capture pipeline automatically
+if no change event has fired for `--stall-timeout-s` seconds (default 90):
+
+```bash
+python3 capture.py --diff --stall-timeout-s 60 --save-settled --save-dir out
+```
+
+Use `--stall-timeout-s 0` to disable. GStreamer `WARNING` bus messages are
+also printed now (previously only `ERROR`/`EOS` were surfaced), so a
+recurrence should show up directly in this script's own log instead of only
+in `journalctl`.
