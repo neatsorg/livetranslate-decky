@@ -37,6 +37,28 @@ def collect_text(data):
     return "\n".join(region.get("text", "").strip() for region in contexts).strip()
 
 
+def _normalize_for_match(value):
+    return "".join(ch for ch in value.upper() if ch.isalnum())
+
+
+def strip_leading_speaker(text, speaker):
+    """Drop a leading line that just duplicates the speaker name.
+
+    A body-text OCR region that is miscalibrated (or a game whose layout
+    puts the name tag right above the dialogue) can capture the speaker
+    name as the first line of the body text. Region tuning should be the
+    real fix, but this is a cheap, engine-agnostic safety net for whatever
+    slips through, on this game or any other.
+    """
+    if not text or not speaker:
+        return text
+    lines = text.split("\n")
+    first, rest = lines[0].strip(), lines[1:]
+    if _normalize_for_match(first) == _normalize_for_match(speaker):
+        return "\n".join(rest).strip()
+    return text
+
+
 def build_prompt(speaker, text, target_lang):
     context_line = f"Speaker: {speaker}\n" if speaker else ""
     return (
@@ -77,7 +99,7 @@ def main():
 
     data = load_ocr(args.ocr_json)
     speaker = pick_speaker(data)
-    text = collect_text(data)
+    text = strip_leading_speaker(collect_text(data), speaker)
     if not text:
         raise SystemExit("No useful text region found")
 

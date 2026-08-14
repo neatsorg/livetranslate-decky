@@ -181,7 +181,7 @@ class Worker:
         ocr_json = {"regions": ocr_results}
 
         speaker = self.translate.pick_speaker(ocr_json)
-        text = self.translate.collect_text(ocr_json)
+        text = self.translate.strip_leading_speaker(self.translate.collect_text(ocr_json), speaker)
         if not text:
             raise ValueError("No useful text region found")
 

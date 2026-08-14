@@ -69,7 +69,7 @@ def main():
     ocr_json = {"regions": ocr_results}
 
     speaker = translate.pick_speaker(ocr_json)
-    text = translate.collect_text(ocr_json)
+    text = translate.strip_leading_speaker(translate.collect_text(ocr_json), speaker)
     if not text:
         raise SystemExit("No useful text region found")
 

@@ -90,10 +90,16 @@ def crop_image(source, region):
     return source.crop((left, top, right, bottom))
 
 
+def binarize_image(image, threshold):
+    gray = image.convert("L")
+    return gray.point(lambda p: 0 if p >= threshold else 255).convert("RGB")
+
+
 def prepare_image(image_path, region, suffix):
     resize = int(region.get("resize", 100))
     no_crop = bool(region.get("no_crop", False))
-    if no_crop and resize == 100:
+    threshold = region.get("white_text_threshold")
+    if no_crop and resize == 100 and threshold is None:
         return image_path
 
     output = Path(tempfile.gettempdir()) / f"playtranslate_ocr_{suffix}.png"
@@ -105,6 +111,8 @@ def prepare_image(image_path, region, suffix):
             width = max(int(image.width * resize / 100), 1)
             height = max(int(image.height * resize / 100), 1)
             image = image.resize((width, height), Image.Resampling.LANCZOS)
+        if threshold is not None:
+            image = binarize_image(image, int(threshold))
         image.save(output)
     return output
 
