@@ -11,6 +11,8 @@ gets faster once tesserocr is added to the box.
 import argparse
 import importlib.util
 import json
+import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,26 @@ try:
     import tesserocr
 except ImportError:
     tesserocr = None
+
+
+def find_tessdata_prefix():
+    """tesserocr wheels vendor their own tesseract and don't reliably find the
+    system tessdata dir on their own (seen defaulting to './' on Arch, while
+    the tesseract CLI finds /usr/share/tessdata fine via its own compiled-in
+    default). Resolve it explicitly instead of trusting tesserocr's default.
+    """
+    env = os.environ.get("TESSDATA_PREFIX")
+    if env and Path(env).is_dir():
+        return env
+    for candidate in (
+        "/usr/share/tessdata",
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tesseract-ocr/4.00/tessdata",
+        "/usr/local/share/tessdata",
+    ):
+        if Path(candidate).is_dir():
+            return candidate
+    return None
 
 
 def load_module(path, name):
@@ -36,7 +58,8 @@ class TesserocrEngine:
 
     name = "tesserocr"
 
-    def __init__(self):
+    def __init__(self, tessdata_path):
+        self._tessdata_path = tessdata_path
         self._lock = threading.Lock()
         self._apis = {}
 
@@ -44,7 +67,7 @@ class TesserocrEngine:
         key = (lang, oem)
         api = self._apis.get(key)
         if api is None:
-            api = tesserocr.PyTessBaseAPI(lang=lang, oem=oem)
+            api = tesserocr.PyTessBaseAPI(path=self._tessdata_path, lang=lang, oem=oem)
             self._apis[key] = api
         return api
 
@@ -81,9 +104,12 @@ class Worker:
             if tesserocr is None:
                 raise
 
-        if tesserocr is not None:
-            self.engine = TesserocrEngine()
+        tessdata_path = find_tessdata_prefix() if tesserocr is not None else None
+        if tesserocr is not None and tessdata_path:
+            self.engine = TesserocrEngine(tessdata_path)
         else:
+            if tesserocr is not None:
+                print(f"tesserocr installed but no tessdata dir found; using CLI fallback", file=sys.stderr, flush=True)
             self.engine = CliEngine(self.ocr, self.tesseract_path)
 
         self.started_at = time.monotonic()
@@ -120,6 +146,7 @@ class Worker:
             error = None
         except Exception as exc:
             raw_text, cleaned_text, error = "", "", str(exc)
+            print(f"ocr region '{name}' failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return {
             "name": name,
             "role": role,
