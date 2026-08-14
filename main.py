@@ -384,19 +384,23 @@ class Plugin:
             return json.loads(response.read().decode("utf-8"))
 
     def _run_translation(self, engine_dir, image_path):
-        if self._is_ocr_worker_running():
-            try:
-                result = self._run_translation_via_worker(image_path, engine_dir)
-                translation = str(result.get("translation") or "").strip()
-                if not translation:
-                    return False, "", "ocr worker returned an empty translation"
-                self._write_translation_outputs(translation, result)
-                timing = result.get("timing")
-                if timing:
-                    self._append_translation_worker_log(f"worker timing: {json.dumps(timing, ensure_ascii=False)}")
-                return True, translation, ""
-            except (urlerror.URLError, OSError, ValueError, KeyError) as exc:
-                self._append_translation_worker_log(f"ocr worker call failed, falling back to distrobox path: {exc}")
+        # Always attempt the worker rather than gating on self.ocr_worker_process:
+        # that handle is only set for workers this process itself spawned, so a
+        # worker adopted from a previous plugin load (see _ensure_ocr_worker)
+        # would otherwise be skipped forever even though it's healthy. A failed
+        # call (worker absent, stale, or unhealthy) falls back below regardless.
+        try:
+            result = self._run_translation_via_worker(image_path, engine_dir)
+            translation = str(result.get("translation") or "").strip()
+            if not translation:
+                return False, "", "ocr worker returned an empty translation"
+            self._write_translation_outputs(translation, result)
+            timing = result.get("timing")
+            if timing:
+                self._append_translation_worker_log(f"worker timing: {json.dumps(timing, ensure_ascii=False)}")
+            return True, translation, ""
+        except (urlerror.URLError, OSError, ValueError, KeyError) as exc:
+            self._append_translation_worker_log(f"ocr worker call failed, falling back to distrobox path: {exc}")
 
         return self._run_translation_runner(engine_dir)
 
@@ -492,40 +496,18 @@ class Plugin:
         if not image_path.exists():
             return {"error": f"{image_path} was not found", **(await self.status())}
 
-        runner = self.data_dir / "run_translate.sh"
-        if not runner.exists():
-            return {"error": f"{runner} was not found", **(await self.status())}
-
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        env = self._subprocess_env()
-        env.setdefault("PLAYTRANSLATE_DATA_DIR", str(self.data_dir))
-        env.setdefault("PLAYTRANSLATE_ENGINE_DIR", str(engine_dir))
-        env.setdefault("PLAYTRANSLATE_TRANSLATE_URL", self._translate_url())
 
         self.translation_in_progress = True
         try:
-            try:
-                result = subprocess.run(
-                    [str(runner)],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=180,
-                    env=env,
-                )
-            except subprocess.CalledProcessError as exc:
-                error = (exc.stderr or exc.stdout or str(exc)).strip()
-                return {"error": error, **(await self.status())}
-            except subprocess.TimeoutExpired:
-                return {"error": "translation timed out", **(await self.status())}
-            except OSError as exc:
-                return {"error": str(exc), **(await self.status())}
+            ok, stdout, stderr = await asyncio.to_thread(self._run_translation, engine_dir, image_path)
         finally:
             self.translation_in_progress = False
 
-        if result.stdout.strip() and not self.translation_path.exists():
-            self.translation_path.write_text(result.stdout.strip() + "\n", encoding="utf-8")
+        if not ok:
+            error = (stderr or stdout or "translation failed").strip()
+            return {"error": error, **(await self.status())}
+
         try:
             self.last_translated_image_mtime_ns = image_path.stat().st_mtime_ns
         except OSError:
