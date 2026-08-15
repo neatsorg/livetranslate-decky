@@ -156,6 +156,12 @@ class Worker:
             **({"error": error} if error else {}),
         }
 
+    def test_region(self, image_path, region):
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(str(image_path))
+        return self._ocr_region(image_path, region, 0)
+
     def translate_image(self, image_path, regions_json, http_url, target_lang):
         t_start = time.monotonic()
         image_path = Path(image_path)
@@ -233,12 +239,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/translate":
+        if self.path == "/translate":
+            self._handle_translate()
+        elif self.path == "/test_region":
+            self._handle_test_region()
+        else:
             self.send_json(404, {"error": "not found"})
-            return
+
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    def _handle_translate(self):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = self._read_json_body()
             image = payload.get("image")
             regions_json = payload.get("regions_json")
             http_url = payload.get("http_url")
@@ -247,6 +261,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "image, regions_json, http_url are required"})
                 return
             result = self.server.worker.translate_image(image, regions_json, http_url, target_lang)
+            self.send_json(200, result)
+        except (FileNotFoundError, ValueError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def _handle_test_region(self):
+        try:
+            payload = self._read_json_body()
+            image = payload.get("image")
+            region = payload.get("region")
+            if not image or not isinstance(region, dict):
+                self.send_json(400, {"error": "image and region are required"})
+                return
+            result = self.server.worker.test_region(image, region)
             self.send_json(200, result)
         except (FileNotFoundError, ValueError) as exc:
             self.send_json(400, {"error": str(exc)})

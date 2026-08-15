@@ -14,7 +14,7 @@ if [[ "${TRANSLATE_URL}" =~ ^https?://[^/]+/?$ ]]; then
 fi
 
 IMAGE_PATH="${DATA_DIR}/captures/last_settled.png"
-REGIONS_JSON="${ENGINE_DIR}/ocr_regions.enigma_of_fear.example.json"
+REGIONS_JSON="${PLAYTRANSLATE_REGIONS_JSON:-${ENGINE_DIR}/ocr_regions.enigma_of_fear.json}"
 OCR_SCRIPT="${ENGINE_DIR}/ocr_tesseract.py"
 TRANSLATE_SCRIPT="${ENGINE_DIR}/translate_stub.py"
 PIPELINE_SCRIPT="${ENGINE_DIR}/translate_pipeline.py"

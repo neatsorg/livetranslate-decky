@@ -2,12 +2,13 @@ import {
   ButtonItem,
   PanelSection,
   PanelSectionRow,
-  findModuleChild,
   staticClasses,
 } from "@decky/ui";
 import { callable, definePlugin, routerHook } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
 import { FaLanguage } from "react-icons/fa";
+import { CompositionRequest, UIComposition } from "./Composition";
+import { openRegionCalibration } from "./Calibration";
 
 type CaptureStatus = {
   running: boolean;
@@ -146,33 +147,6 @@ function startHotkeyPolling() {
     window.removeEventListener("playtranslate-hud-visible", handleHudVisible);
     window.removeEventListener("playtranslate-hud-hidden", handleHudHidden);
   };
-}
-
-enum UIComposition {
-  Notification = 1,
-  Overlay = 2,
-}
-
-const useUIComposition: (composition: UIComposition) => void = findModuleChild((m) => {
-  if (typeof m !== "object") return undefined;
-  for (const prop in m) {
-    const fn = (m as Record<string, unknown>)[prop];
-    if (
-      typeof fn === "function" &&
-      fn.toString().includes("AddMinimumCompositionStateRequest") &&
-      fn.toString().includes("ChangeMinimumCompositionStateRequest") &&
-      fn.toString().includes("RemoveMinimumCompositionStateRequest") &&
-      !fn.toString().includes("m_mapCompositionStateRequests")
-    ) {
-      return fn;
-    }
-  }
-  return undefined;
-});
-
-function CompositionRequest({ level }: { level: UIComposition }) {
-  useUIComposition(level);
-  return null;
 }
 
 function SubtitleHud({
@@ -457,6 +431,11 @@ function Content() {
       <PanelSectionRow>
         <ButtonItem disabled={!hudVisible} layout="below" onClick={hideHud}>
           Hide HUD
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={busy} layout="below" onClick={() => openRegionCalibration()}>
+          Calibrate Regions
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>

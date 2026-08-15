@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import json
 import os
+import re
 import select
 import signal
 import struct
@@ -11,6 +13,9 @@ from urllib import parse, request
 from pathlib import Path
 
 import decky
+
+_GAME_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_DEFAULT_GAME_ID = "enigma_of_fear"
 
 
 class Plugin:
@@ -250,8 +255,185 @@ class Plugin:
     def _ocr_worker_translate_url(self):
         return f"http://127.0.0.1:{self._ocr_worker_port()}/translate"
 
+    def _ocr_worker_test_region_url(self):
+        return f"http://127.0.0.1:{self._ocr_worker_port()}/test_region"
+
+    def _valid_game_id(self, game_id):
+        return bool(game_id) and bool(_GAME_ID_RE.match(game_id))
+
+    def _active_game_path(self):
+        return self.data_dir / "active_game.txt"
+
+    def _get_active_game_id(self):
+        game_id = self._read_text_file(self._active_game_path())
+        return game_id if self._valid_game_id(game_id) else _DEFAULT_GAME_ID
+
+    def _region_config_path(self, engine_dir, game_id):
+        return engine_dir / f"ocr_regions.{game_id}.json"
+
     def _regions_json_path(self, engine_dir):
-        return engine_dir / "ocr_regions.enigma_of_fear.example.json"
+        return self._region_config_path(engine_dir, self._get_active_game_id())
+
+    async def get_active_game(self):
+        return {"active": self._get_active_game_id()}
+
+    async def set_active_game(self, game_id):
+        game_id = str(game_id or "").strip()
+        if not self._valid_game_id(game_id):
+            return {"ok": False, "error": "game id must be non-empty and use only letters, numbers, underscore"}
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._active_game_path().write_text(game_id, encoding="utf-8")
+        return {"ok": True, "active": game_id}
+
+    async def list_region_configs(self):
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        games = []
+        if engine_dir:
+            for path in sorted(engine_dir.glob("ocr_regions.*.json")):
+                game_id = path.name[len("ocr_regions.") : -len(".json")]
+                if self._valid_game_id(game_id):
+                    games.append(game_id)
+        return {"games": games, "active": self._get_active_game_id()}
+
+    async def get_region_config(self, game_id):
+        game_id = str(game_id or "").strip()
+        if not self._valid_game_id(game_id):
+            return {"ok": False, "error": "invalid game id", "regions": []}
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            return {"ok": False, "error": "engine directory was not found", "regions": []}
+        path = self._region_config_path(engine_dir, game_id)
+        if not path.exists():
+            return {"ok": True, "regions": []}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc), "regions": []}
+        regions = data.get("ocr_regions") if isinstance(data, dict) else data
+        return {"ok": True, "regions": regions or []}
+
+    def _reference_image_path(self, engine_dir, game_id):
+        return engine_dir / f"ocr_regions.{game_id}.reference.png"
+
+    async def save_region_config(self, game_id, regions, reference_image_base64=None):
+        game_id = str(game_id or "").strip()
+        if not self._valid_game_id(game_id):
+            return {"ok": False, "error": "game id must be non-empty and use only letters, numbers, underscore"}
+        if not isinstance(regions, list):
+            return {"ok": False, "error": "regions must be a list"}
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            return {"ok": False, "error": "engine directory was not found"}
+        path = self._region_config_path(engine_dir, game_id)
+        try:
+            path.write_text(
+                json.dumps({"ocr_regions": regions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        # Best-effort: a saved region set is much more useful later (re-editing
+        # a game whose regions drifted, or without the game even running) if
+        # it's paired with the screenshot it was drawn against. A failure here
+        # shouldn't fail the actual save, which is why regions are already
+        # written and returned as ok above regardless of what happens next.
+        if reference_image_base64:
+            try:
+                self._reference_image_path(engine_dir, game_id).write_bytes(
+                    base64.b64decode(reference_image_base64)
+                )
+            except (OSError, ValueError):
+                pass
+
+        return {"ok": True, "path": str(path)}
+
+    async def get_reference_image(self, game_id):
+        game_id = str(game_id or "").strip()
+        if not self._valid_game_id(game_id):
+            return {"ok": False, "error": "invalid game id"}
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            return {"ok": False, "error": "engine directory was not found"}
+        return self._read_image_base64(self._reference_image_path(engine_dir, game_id))
+
+    def _read_image_base64(self, image_path):
+        if not image_path.exists():
+            return {"ok": False, "error": f"{image_path} was not found"}
+        try:
+            data = image_path.read_bytes()
+            mtime_ns = image_path.stat().st_mtime_ns
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "base64": base64.b64encode(data).decode("ascii"),
+            "mtime_ns": mtime_ns,
+            "path": str(image_path),
+        }
+
+    async def get_last_settled_image(self):
+        return self._read_image_base64(self.data_dir / "captures" / "last_settled.png")
+
+    def _steam_screenshot_paths(self):
+        userdata = Path.home() / ".local" / "share" / "Steam" / "userdata"
+        patterns = (
+            "*/760/remote/*/screenshots/*.jpg",
+            "*/760/remote/*/screenshots/*.jpeg",
+            "*/760/remote/*/screenshots/*.png",
+        )
+        paths = [path for pattern in patterns for path in userdata.glob(pattern)]
+        paths.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        return paths
+
+    async def get_latest_steam_screenshot(self):
+        # SteamClient.Screenshots.GetLastScreenshotTaken() and
+        # GameSessions.RegisterForScreenshotNotification() were both tried
+        # from the plugin frontend first (see Calibration.tsx history) but
+        # neither ever resolved/fired in live testing, despite screenshots
+        # visibly accumulating in Steam's own userdata folder - that API
+        # surface doesn't seem to work reliably from a Decky plugin's
+        # sandboxed context. Polling the folder directly (same mtime-watch
+        # pattern this file already uses for translation results) sidesteps
+        # that entirely.
+        try:
+            candidates = await asyncio.to_thread(self._steam_screenshot_paths)
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not candidates:
+            return {"ok": False, "error": "no Steam screenshots found"}
+        return self._read_image_base64(candidates[0])
+
+    async def test_ocr_region(self, region, image_path=None):
+        if not isinstance(region, dict):
+            return {"ok": False, "error": "region must be an object"}
+        # image_path is whatever's currently loaded in the calibration UI
+        # (see Calibration.tsx's imagePath state) - region x/y/width/height
+        # are percentages of THAT image, so testing against a different one
+        # (the old hardcoded default here) crops the wrong pixels entirely.
+        image_path = Path(image_path) if image_path else self.data_dir / "captures" / "last_settled.png"
+        if not image_path.exists():
+            return {"ok": False, "error": f"{image_path} was not found"}
+
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if engine_dir:
+            await self._ensure_ocr_worker(engine_dir)
+
+        payload = json.dumps({"image": str(image_path), "region": region}).encode("utf-8")
+        req = request.Request(
+            self._ocr_worker_test_region_url(),
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+
+        def call():
+            try:
+                with request.urlopen(req, timeout=15) as response:
+                    return {"ok": True, **json.loads(response.read().decode("utf-8"))}
+            except (urlerror.URLError, OSError, ValueError) as exc:
+                return {"ok": False, "error": str(exc)}
+
+        return await asyncio.to_thread(call)
 
     def _is_ocr_worker_running(self):
         return self.ocr_worker_process is not None and self.ocr_worker_process.poll() is None
@@ -535,6 +717,7 @@ class Plugin:
         env.setdefault("PLAYTRANSLATE_DATA_DIR", str(self.data_dir))
         env.setdefault("PLAYTRANSLATE_ENGINE_DIR", str(engine_dir))
         env.setdefault("PLAYTRANSLATE_TRANSLATE_URL", self._translate_url())
+        env.setdefault("PLAYTRANSLATE_REGIONS_JSON", str(self._regions_json_path(engine_dir)))
 
         try:
             result = subprocess.run(
