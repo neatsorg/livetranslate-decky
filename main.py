@@ -385,6 +385,36 @@ class Plugin:
         paths.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
         return paths
 
+    def _load_capture_roi(self, engine_dir):
+        # capture.py crops to this same roi when it saves last_settled.png
+        # (crop_stage: "save" in config.json), so OCR region x/y/width/height
+        # percentages are only meaningful relative to an image cropped the
+        # same way. A screenshot cropped some other way (or not at all)
+        # silently targets the wrong pixels - this is exactly what happened
+        # when regions were calibrated against the raw, uncropped Steam
+        # screenshot: same percentages, different image, wrong crop.
+        try:
+            config = json.loads((engine_dir / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if config.get("crop_stage") != "save":
+            return None
+        return config.get("roi") or None
+
+    def _crop_to_roi_via_worker(self, image_path, roi, output_path):
+        payload = json.dumps({"image": str(image_path), "roi": roi, "output": str(output_path)}).encode("utf-8")
+        req = request.Request(
+            f"http://127.0.0.1:{self._ocr_worker_port()}/crop_to_roi",
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=15) as response:
+                return 200 <= response.status < 300
+        except (urlerror.URLError, OSError):
+            return False
+
     async def get_latest_steam_screenshot(self):
         # SteamClient.Screenshots.GetLastScreenshotTaken() and
         # GameSessions.RegisterForScreenshotNotification() were both tried
@@ -401,7 +431,20 @@ class Plugin:
             return {"ok": False, "error": str(exc)}
         if not candidates:
             return {"ok": False, "error": "no Steam screenshots found"}
-        return self._read_image_base64(candidates[0])
+
+        image_path = candidates[0]
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        roi = self._load_capture_roi(engine_dir) if engine_dir else None
+        if roi and engine_dir:
+            await self._ensure_ocr_worker(engine_dir)
+            output_path = self.data_dir / "captures" / "calibration_source.png"
+            cropped_ok = await asyncio.to_thread(self._crop_to_roi_via_worker, image_path, roi, output_path)
+            if cropped_ok:
+                return self._read_image_base64(output_path)
+            # Worker down, bad roi, etc. - fall back to the uncropped shot
+            # rather than blocking calibration entirely; the region
+            # percentages just won't match runtime until this succeeds.
+        return self._read_image_base64(image_path)
 
     async def test_ocr_region(self, region, image_path=None):
         if not isinstance(region, dict):

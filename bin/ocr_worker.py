@@ -162,6 +162,23 @@ class Worker:
             raise FileNotFoundError(str(image_path))
         return self._ocr_region(image_path, region, 0)
 
+    def crop_to_roi(self, image_path, roi, output_path):
+        # Used to make a fresh (QAM-free) full-frame screenshot match the
+        # coordinate space of last_settled.png before it's shown for OCR
+        # region calibration - capture.py crops to this same roi at save
+        # time, so region x/y/width/height percentages are only meaningful
+        # relative to an image cropped the same way. See Calibration.tsx /
+        # main.py's get_latest_steam_screenshot.
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(str(image_path))
+        output_path = Path(output_path)
+        with self.ocr.Image.open(image_path) as image:
+            image = image.convert("RGB")
+            cropped = self.ocr.crop_image(image, roi)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cropped.save(output_path)
+
     def translate_image(self, image_path, regions_json, http_url, target_lang):
         t_start = time.monotonic()
         image_path = Path(image_path)
@@ -243,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_translate()
         elif self.path == "/test_region":
             self._handle_test_region()
+        elif self.path == "/crop_to_roi":
+            self._handle_crop_to_roi()
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -277,6 +296,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = self.server.worker.test_region(image, region)
             self.send_json(200, result)
+        except (FileNotFoundError, ValueError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def _handle_crop_to_roi(self):
+        try:
+            payload = self._read_json_body()
+            image = payload.get("image")
+            roi = payload.get("roi")
+            output = payload.get("output")
+            if not image or not isinstance(roi, dict) or not output:
+                self.send_json(400, {"error": "image, roi, output are required"})
+                return
+            self.server.worker.crop_to_roi(image, roi, output)
+            self.send_json(200, {"ok": True})
         except (FileNotFoundError, ValueError) as exc:
             self.send_json(400, {"error": str(exc)})
         except Exception as exc:
