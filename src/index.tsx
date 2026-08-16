@@ -45,12 +45,32 @@ type HidrawTestResult = {
   error?: string;
 };
 
+type ActiveBlock = {
+  id: number;
+  text: string;
+  translation: string;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  last_changed: number;
+};
+
+type ActiveBlocksState = {
+  blocks: ActiveBlock[];
+  updated_at: number | null;
+};
+
 const startCapture = callable<[], CaptureStatus>("start_capture");
 const stopCapture = callable<[], CaptureStatus>("stop_capture");
 const getStatus = callable<[], CaptureStatus>("status");
 const translateLatest = callable<[], CaptureStatus>("translate_latest");
 const testHidrawButtonState = callable<[], HidrawTestResult>("test_hidraw_button_state");
 const checkAiServer = callable<[], AiServerStatus>("check_ai_server");
+const getActiveBlocks = callable<[], ActiveBlocksState>("get_active_blocks");
+
+/** Dynamic-engine output counts as "live" only within this window - past it,
+ * fall back to the single-region pipeline's status().translation so a stale
+ * capture_dynamic.py run (or one that was never started) doesn't leave the
+ * HUD showing frozen multi-block data. */
+const ACTIVE_BLOCKS_FRESHNESS_S = 15;
 
 function startHotkeyPolling() {
   let hotkeyBusy = false;
@@ -58,11 +78,12 @@ function startHotkeyPolling() {
   let holdStart: number | null = null;
   let showTriggeredForPress = false;
   let l4WasPressed = false;
+  let l5WasPressed = false;
   let hudVisible = false;
 
-  const showHud = (text: string) => {
+  const showHud = (text: string, blocks?: ActiveBlock[]) => {
     hudVisible = true;
-    window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text } }));
+    window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text, blocks } }));
   };
 
   const hideHud = () => {
@@ -90,8 +111,18 @@ function startHotkeyPolling() {
       if (!result.success) {
         holdStart = null;
         showTriggeredForPress = false;
+        l4WasPressed = false;
+        l5WasPressed = false;
         return;
       }
+
+      // L5: edge-triggered "show the next block" - independent of L4's
+      // show/hold handling below, only does anything while the HUD is up.
+      const l5Pressed = result.buttons.includes("L5");
+      if (l5Pressed && !l5WasPressed && hudVisible) {
+        window.dispatchEvent(new CustomEvent("playtranslate-cycle-hud"));
+      }
+      l5WasPressed = l5Pressed;
 
       const l4Pressed = result.buttons.includes("L4");
       if (!l4Pressed) {
@@ -122,6 +153,16 @@ function startHotkeyPolling() {
       showTriggeredForPress = true;
       hotkeyBusy = true;
       try {
+        const activeBlocks = await getActiveBlocks();
+        const isFresh =
+          activeBlocks.updated_at != null &&
+          Date.now() / 1000 - activeBlocks.updated_at < ACTIVE_BLOCKS_FRESHNESS_S;
+        if (isFresh && activeBlocks.blocks.length > 0) {
+          const top = activeBlocks.blocks[0];
+          showHud(top.translation || top.text, activeBlocks.blocks);
+          return;
+        }
+
         const next = await getStatus();
         if (!next.error && next.translation && !next.translation_stale) {
           showHud(next.translation);
@@ -137,6 +178,7 @@ function startHotkeyPolling() {
     } catch {
       holdStart = null;
       showTriggeredForPress = false;
+      l5WasPressed = false;
     } finally {
       pollingInput = false;
     }
@@ -206,6 +248,12 @@ function GlobalHud() {
   const [translation, setTranslation] = useState("");
   const hudTimerRef = useRef<number | null>(null);
   const visibleRef = useRef(false);
+  // Blocks + cursor for the L5 "next block" operation. Refs (not state)
+  // because they're only ever read/written from event handlers, never
+  // rendered directly - only `translation` (the currently-displayed text)
+  // needs to trigger a re-render.
+  const blocksRef = useRef<ActiveBlock[]>([]);
+  const blockIndexRef = useRef(0);
 
   const releaseFocus = () => {
     window.setTimeout(() => {
@@ -222,14 +270,7 @@ function GlobalHud() {
     }, 120);
   };
 
-  const showHud = (text: string, durationMs = 6000) => {
-    if (!text.trim()) {
-      return;
-    }
-    setTranslation(text.trim());
-    visibleRef.current = true;
-    window.dispatchEvent(new CustomEvent("playtranslate-hud-visible"));
-    setVisible(true);
+  const resetHideTimer = (durationMs: number) => {
     if (hudTimerRef.current !== null) {
       window.clearTimeout(hudTimerRef.current);
     }
@@ -239,7 +280,37 @@ function GlobalHud() {
       setVisible(false);
       hudTimerRef.current = null;
     }, durationMs);
+  };
+
+  const showHud = (text: string, durationMs = 6000, blocks: ActiveBlock[] = []) => {
+    if (!text.trim()) {
+      return;
+    }
+    setTranslation(text.trim());
+    blocksRef.current = blocks;
+    blockIndexRef.current = 0;
+    visibleRef.current = true;
+    window.dispatchEvent(new CustomEvent("playtranslate-hud-visible"));
+    setVisible(true);
+    resetHideTimer(durationMs);
     releaseFocus();
+  };
+
+  // L5: advance to the next block in the current priority list and keep
+  // the HUD up while the user browses. No-op with 0 or 1 blocks (nothing
+  // to cycle to) or while hidden.
+  const cycleHud = () => {
+    const blocks = blocksRef.current;
+    if (!visibleRef.current || blocks.length < 2) {
+      return;
+    }
+    blockIndexRef.current = (blockIndexRef.current + 1) % blocks.length;
+    const next = blocks[blockIndexRef.current];
+    const text = (next.translation || next.text || "").trim();
+    if (text) {
+      setTranslation(text);
+    }
+    resetHideTimer(6000);
   };
 
   const hideHud = () => {
@@ -255,18 +326,23 @@ function GlobalHud() {
 
   useEffect(() => {
     const handleShow = (event: Event) => {
-      const detail = (event as CustomEvent<{ text?: string }>).detail;
-      showHud(detail?.text ?? "");
+      const detail = (event as CustomEvent<{ text?: string; blocks?: ActiveBlock[] }>).detail;
+      showHud(detail?.text ?? "", undefined, detail?.blocks ?? []);
     };
     const handleHide = () => {
       hideHud();
     };
+    const handleCycle = () => {
+      cycleHud();
+    };
 
     window.addEventListener("playtranslate-show-hud", handleShow);
     window.addEventListener("playtranslate-hide-hud", handleHide);
+    window.addEventListener("playtranslate-cycle-hud", handleCycle);
     return () => {
       window.removeEventListener("playtranslate-show-hud", handleShow);
       window.removeEventListener("playtranslate-hide-hud", handleHide);
+      window.removeEventListener("playtranslate-cycle-hud", handleCycle);
     };
   }, []);
 

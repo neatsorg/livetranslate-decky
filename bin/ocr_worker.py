@@ -92,6 +92,110 @@ class CliEngine:
         return self._ocr.run_tesseract(self._tesseract, image_path, lang, psm, oem)
 
 
+def group_lines_into_blocks(lines, vertical_gap_ratio=0.6, horizontal_overlap_ratio=0.3):
+    """Merge individual OCR text lines into paragraph-like blocks.
+
+    Tesseract's PSM.SPARSE_TEXT doesn't build real paragraph/block structure -
+    verified empirically against real game frames: iterating at RIL.PARA or
+    RIL.BLOCK returns exactly the same one-line-per-item output as
+    RIL.TEXTLINE, since sparse mode assumes scattered, layout-less text. A
+    dialogue message that wraps across N lines therefore comes back as N
+    separate same-priority "blocks" unless grouped here - which then get
+    discovered/tracked/translated as unrelated fragments instead of one
+    coherent message.
+
+    Two lines merge when they're vertically close *relative to their own
+    line height* (not a fixed pixel constant, so this scales across font
+    sizes/DPI/game resolutions) and their horizontal spans substantially
+    overlap - the overlap check is what distinguishes a wrapped paragraph
+    from an unrelated line that happens to sit at a similar height (e.g. a
+    HUD icon off to the side of a dialogue box).
+
+    Input: [{"text", "conf", "bbox": (x0,y0,x1,y1)}, ...]
+    Output: [{"id", "text", "conf", "bbox": {"x0","y0","x1","y1"}}, ...]
+    """
+    ordered = sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0]))
+    groups = []
+    for line in ordered:
+        x0, y0, x1, y1 = line["bbox"]
+        for group in groups:
+            gx0, gy0, gx1, gy1 = group["bbox"]
+            line_h = y1 - y0
+            group_h = gy1 - gy0
+            gap = max(y0 - gy1, 0)
+            vertical_ok = gap <= vertical_gap_ratio * max(line_h, group_h, 1)
+            overlap = min(x1, gx1) - max(x0, gx0)
+            shorter_width = min(x1 - x0, gx1 - gx0)
+            horizontal_ok = shorter_width > 0 and overlap / shorter_width >= horizontal_overlap_ratio
+            if vertical_ok and horizontal_ok:
+                group["bbox"] = (min(x0, gx0), min(y0, gy0), max(x1, gx1), max(y1, gy1))
+                group["texts"].append(line["text"])
+                group["confs"].append(line["conf"])
+                break
+        else:
+            groups.append({"bbox": (x0, y0, x1, y1), "texts": [line["text"]], "confs": [line["conf"]]})
+
+    blocks = []
+    for group_id, group in enumerate(groups):
+        gx0, gy0, gx1, gy1 = group["bbox"]
+        blocks.append(
+            {
+                "id": group_id,
+                "text": " ".join(group["texts"]),
+                "conf": round(min(group["confs"]), 1),
+                "bbox": {"x0": gx0, "y0": gy0, "x1": gx1, "y1": gy1},
+            }
+        )
+    return blocks
+
+
+class DiscoveryEngine:
+    """Full-frame sparse-text OCR for dynamic text-block discovery.
+
+    Separate from TesserocrEngine because it needs PSM.SPARSE_TEXT plus
+    per-line bounding boxes and confidence, not a single block of plain
+    text for one pre-cropped region. tesserocr only, no CLI fallback -
+    getting TSV/box data out of the `tesseract` CLI needs parsing a
+    different output format, and every deployment target for this so far
+    has tesserocr available.
+    """
+
+    name = "tesserocr-discovery"
+
+    def __init__(self, tessdata_path):
+        self._tessdata_path = tessdata_path
+        self._lock = threading.Lock()
+        self._apis = {}  # lang -> PyTessBaseAPI
+
+    def _api_for(self, lang):
+        api = self._apis.get(lang)
+        if api is None:
+            api = tesserocr.PyTessBaseAPI(
+                path=self._tessdata_path, lang=lang, psm=tesserocr.PSM.SPARSE_TEXT
+            )
+            self._apis[lang] = api
+        return api
+
+    def discover(self, image_path, lang, conf_threshold):
+        with self._lock:
+            api = self._api_for(lang)
+            api.SetImageFile(str(image_path))
+            api.Recognize()
+            lines = []
+            ri = api.GetIterator()
+            if ri:
+                level = tesserocr.RIL.TEXTLINE
+                while True:
+                    text = ri.GetUTF8Text(level)
+                    conf = ri.Confidence(level)
+                    bbox = ri.BoundingBox(level)
+                    if text and text.strip() and bbox and conf >= conf_threshold:
+                        lines.append({"text": text.strip(), "conf": conf, "bbox": bbox})
+                    if not ri.Next(level):
+                        break
+            return group_lines_into_blocks(lines)
+
+
 class Worker:
     def __init__(self, ocr_script, translate_script):
         self.ocr = load_module(ocr_script, "playtranslate_worker_ocr")
@@ -107,10 +211,12 @@ class Worker:
         tessdata_path = find_tessdata_prefix() if tesserocr is not None else None
         if tesserocr is not None and tessdata_path:
             self.engine = TesserocrEngine(tessdata_path)
+            self.discovery_engine = DiscoveryEngine(tessdata_path)
         else:
             if tesserocr is not None:
                 print(f"tesserocr installed but no tessdata dir found; using CLI fallback", file=sys.stderr, flush=True)
             self.engine = CliEngine(self.ocr, self.tesseract_path)
+            self.discovery_engine = None
 
         self.started_at = time.monotonic()
         self._regions_cache = {}  # path str -> (mtime_ns, regions)
@@ -178,6 +284,16 @@ class Worker:
             cropped = self.ocr.crop_image(image, roi)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cropped.save(output_path)
+
+    def discover_blocks(self, image_path, lang="eng", conf_threshold=70.0):
+        if self.discovery_engine is None:
+            raise RuntimeError("discovery requires tesserocr + tessdata (CLI fallback not supported)")
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(str(image_path))
+        t0 = time.monotonic()
+        blocks = self.discovery_engine.discover(image_path, lang, conf_threshold)
+        return {"blocks": blocks, "elapsed_s": round(time.monotonic() - t0, 3)}
 
     def translate_image(self, image_path, regions_json, http_url, target_lang):
         t_start = time.monotonic()
@@ -262,6 +378,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_test_region()
         elif self.path == "/crop_to_roi":
             self._handle_crop_to_roi()
+        elif self.path == "/discover_blocks":
+            self._handle_discover_blocks()
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -295,6 +413,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "image and region are required"})
                 return
             result = self.server.worker.test_region(image, region)
+            self.send_json(200, result)
+        except (FileNotFoundError, ValueError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def _handle_discover_blocks(self):
+        try:
+            payload = self._read_json_body()
+            image = payload.get("image")
+            lang = payload.get("lang", "eng")
+            conf_threshold = float(payload.get("conf_threshold", 70.0))
+            if not image:
+                self.send_json(400, {"error": "image is required"})
+                return
+            result = self.server.worker.discover_blocks(image, lang, conf_threshold)
             self.send_json(200, result)
         except (FileNotFoundError, ValueError) as exc:
             self.send_json(400, {"error": str(exc)})

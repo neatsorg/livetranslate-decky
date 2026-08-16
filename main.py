@@ -35,6 +35,7 @@ class Plugin:
         self.translation_json_path = self.data_dir / "last_translation.json"
         self.translation_error_path = self.data_dir / "last_translation_error.txt"
         self.translate_url_path = self.data_dir / "translate_url.txt"
+        self.active_blocks_path = self.data_dir / "active_blocks.json"
         self.hidraw_path = None
 
     async def _main(self):
@@ -373,6 +374,24 @@ class Plugin:
 
     async def get_last_settled_image(self):
         return self._read_image_base64(self.data_dir / "captures" / "last_settled.png")
+
+    async def get_active_blocks(self):
+        """Priority-ordered dynamic text blocks + translations, written by
+        capture_dynamic.py (see its docstring). Returns an empty list when
+        that engine isn't running yet - callers should fall back to the
+        single-region `status().translation` in that case.
+        """
+        try:
+            raw = self.active_blocks_path.read_text(encoding="utf-8")
+        except (OSError, FileNotFoundError):
+            return {"blocks": [], "updated_at": None}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"blocks": [], "updated_at": None}
+        if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
+            return {"blocks": [], "updated_at": None}
+        return {"blocks": data["blocks"], "updated_at": data.get("updated_at")}
 
     def _steam_screenshot_paths(self):
         userdata = Path.home() / ".local" / "share" / "Steam" / "userdata"
