@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -178,6 +179,7 @@ class FrameCounter:
         self.saved_changes = 0
         self.save_limit_reported = False
         self.last_change_time = time.monotonic()
+        self.rebuilds_since_change = 0
         self.pending_settled_save = False
         self.saved_settled = 0
 
@@ -370,6 +372,7 @@ class FrameCounter:
                 self.low_diff_streak = 0
                 self.next_change_frame = self.frames + self.diff_cooldown_frames
                 self.last_change_time = time.monotonic()
+                self.rebuilds_since_change = 0
                 print(
                     f"change frame={self.frames} ratio={self.last_change_ratio:.4f} events={self.change_events}",
                     flush=True,
@@ -396,6 +399,13 @@ class FrameCounter:
         self.low_diff_streak = 0
         self.pending_settled_save = False
         self.last_change_time = time.monotonic()
+
+    def note_rebuild(self):
+        """Call whenever the capture pipeline is rebuilt without a real
+        change event happening first. Used to detect "rebuilding isn't
+        helping" so the caller can escalate to a full process re-exec.
+        """
+        self.rebuilds_since_change += 1
 
     def on_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -544,6 +554,20 @@ def main():
         default=3.0,
         help="Delay before rebuilding the pipeline after a detected resume, to give gamescope time to stabilize first.",
     )
+    parser.add_argument(
+        "--max-rebuilds-before-reexec",
+        type=int,
+        default=1,
+        help=(
+            "Rebuilding the GStreamer pipeline in-process (stall or resume "
+            "watchdog) has been observed to not always be enough - gamescope's "
+            "own PipeWire producer can still be stuck even after we cleanly "
+            "reconnect. If this many consecutive rebuilds happen with no real "
+            "change event in between, re-exec this whole process instead "
+            "(os.execvp - same PID, so a supervisor watching the PID still "
+            "sees it as the same process). Use 0 to never re-exec."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list_node:
@@ -589,6 +613,27 @@ def main():
     resume_watchdog_enabled = args.resume_gap_s > 0
     last_wall_time = time.time()
 
+    def recover(reason):
+        """Rebuild the pipeline in-process, unless that has already failed
+        to restore change detection --max-rebuilds-before-reexec times in a
+        row, in which case re-exec this whole process instead. Does not
+        return when it re-execs.
+        """
+        if 0 < args.max_rebuilds_before_reexec <= counter.rebuilds_since_change:
+            print(
+                f"{reason} - {counter.rebuilds_since_change} in-process rebuild(s) "
+                f"already failed to restore change detection - re-executing the "
+                f"whole process",
+                flush=True,
+            )
+            pipeline.set_state(Gst.State.NULL)
+            os.execvp(sys.executable, [sys.executable] + sys.argv)
+        print(f"{reason} - rebuilding capture pipeline", flush=True)
+        pipeline.set_state(Gst.State.NULL)
+        counter.reset_diff_state()
+        counter.note_rebuild()
+        return start_pipeline(counter)
+
     try:
         while True:
             msg = bus.timed_pop_filtered(
@@ -617,24 +662,18 @@ def main():
             if resume_watchdog_enabled and wall_gap >= args.resume_gap_s:
                 print(
                     f"resume watchdog: wall clock jumped {wall_gap:.0f}s between loop "
-                    f"iterations (likely system suspend/resume) - rebuilding capture "
-                    f"pipeline in {args.resume_grace_s:.0f}s",
+                    f"iterations (likely system suspend/resume) - recovering in "
+                    f"{args.resume_grace_s:.0f}s",
                     flush=True,
                 )
                 time.sleep(args.resume_grace_s)
-                pipeline.set_state(Gst.State.NULL)
-                counter.reset_diff_state()
-                pipeline, bus = start_pipeline(counter)
+                pipeline, bus = recover("resume watchdog")
                 last_wall_time = time.time()
             elif stall_watchdog_enabled and counter.seconds_since_last_change() >= args.stall_timeout_s:
-                print(
+                pipeline, bus = recover(
                     f"stall watchdog: no change event for {args.stall_timeout_s:.0f}s "
-                    f"(frames={counter.frames} still incrementing) - rebuilding capture pipeline",
-                    flush=True,
+                    f"(frames={counter.frames} still incrementing)"
                 )
-                pipeline.set_state(Gst.State.NULL)
-                counter.reset_diff_state()
-                pipeline, bus = start_pipeline(counter)
 
             if args.duration and time.monotonic() - started >= args.duration:
                 return 0

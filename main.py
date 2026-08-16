@@ -910,16 +910,9 @@ class Plugin:
         asyncio.create_task(self._ensure_ocr_worker(engine_dir))
         return await self.status()
 
-    async def stop_capture(self):
-        await self._stop_translation_worker()
-        await self._stop_ocr_worker()
-        _engine_dir, capture_py, _config_json = self._find_engine()
-
+    async def _kill_tracked_capture_process(self):
         if not self._is_running():
-            if capture_py:
-                await self._stop_existing_capture_processes(capture_py)
-            return await self.status()
-
+            return
         pid = self.process.pid
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -932,6 +925,21 @@ class Plugin:
         except ProcessLookupError:
             pass
 
+    async def stop_capture(self):
+        # These three are independent (different subsystems) and each has its
+        # own ~2s worst-case SIGTERM-wait-then-SIGKILL timeout, so running
+        # them sequentially could take ~6s+ - long enough that Decky's
+        # plugin_loader (which force-SIGKILLs the whole plugin backend if
+        # _unload/stop_capture hasn't returned within 5s) could kill this
+        # process mid-cleanup, orphaning whichever subprocess hadn't been
+        # reached yet. Running them concurrently keeps the worst case to
+        # roughly the slowest single one (~2s) instead of their sum.
+        await asyncio.gather(
+            self._stop_translation_worker(),
+            self._stop_ocr_worker(),
+            self._kill_tracked_capture_process(),
+        )
+
         if self.log_file:
             self.log_file.write(f"--- PlayTranslate stop {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             self.log_file.flush()
@@ -939,6 +947,7 @@ class Plugin:
             self.log_file = None
 
         decky.logger.info("Stopped PlayTranslate capture")
+        _engine_dir, capture_py, _config_json = self._find_engine()
         if capture_py:
             await self._stop_existing_capture_processes(capture_py)
         return await self.status()

@@ -156,3 +156,13 @@ this directly - if wall-clock time jumps forward by `--resume-gap-s` (default
 pipeline after `--resume-grace-s` (default 3s, to give gamescope a moment to
 stabilize first) instead of waiting on the slower stall watchdog above. Use
 `--resume-gap-s 0` to disable.
+
+Sometimes an in-process pipeline rebuild isn't enough by itself - gamescope's
+own PipeWire producer can still be stuck even after this script cleanly
+reconnects to it (confirmed live: a second concurrent PipeWire consumer of
+the same gamescope node is one way to trigger this). If `--max-rebuilds-
+before-reexec` (default 1) consecutive rebuilds happen with no real change
+event landing in between, `capture.py` re-execs itself (`os.execvp`, same
+PID) instead of rebuilding again - a much more thorough reset than
+recreating the GStreamer pipeline object alone. Use `--max-rebuilds-before-
+reexec 0` to never re-exec.
