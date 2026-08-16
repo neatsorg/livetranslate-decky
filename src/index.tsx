@@ -57,6 +57,8 @@ type ActiveBlock = {
 type ActiveBlocksState = {
   blocks: ActiveBlock[];
   updated_at: number | null;
+  capture_width: number | null;
+  capture_height: number | null;
 };
 
 const startCapture = callable<[], CaptureStatus>("start_capture");
@@ -413,6 +415,112 @@ function GlobalHud() {
   return <SubtitleHud visible={visible} text={translation} />;
 }
 
+/**
+ * Real-time translation mode ("option 1" from the block-display design
+ * discussion): each currently-valid dynamic-engine block is rendered as its
+ * own small overlay positioned at its original on-screen location, instead
+ * of funneling everything through the single bottom banner + L4/L5 cycling.
+ * This directly resolves the observability gap found testing against NORCO
+ * (which block L5 will show next was never obvious) - translations just
+ * appear where the source text is, no cycling needed.
+ *
+ * Independent of and additive to GlobalHud/L4/L5: renders nothing when the
+ * dynamic engine isn't producing fresh data, so the legacy single-region
+ * pipeline's bottom-HUD flow is completely unaffected.
+ *
+ * capture_dynamic.py already clears a block's translation the moment its
+ * region starts changing (before it resettles) specifically so a
+ * scrolling/growing text box (confirmed on NORCO) doesn't leave a
+ * stale-position translation on screen - this component just needs to
+ * stop rendering blocks that disappear from the list, which it does for
+ * free by rendering from the polled block list directly.
+ */
+function PositionedOverlay() {
+  const [blocks, setBlocks] = useState<ActiveBlock[]>([]);
+  const [captureSize, setCaptureSize] = useState<{ w: number; h: number } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const state = await getActiveBlocks();
+        if (cancelled) return;
+        const isFresh =
+          state.updated_at != null && Date.now() / 1000 - state.updated_at < ACTIVE_BLOCKS_FRESHNESS_S;
+        if (isFresh && state.capture_width && state.capture_height) {
+          setBlocks(state.blocks);
+          setCaptureSize({ w: state.capture_width, h: state.capture_height });
+        } else {
+          setBlocks([]);
+          setCaptureSize(null);
+        }
+      } catch {
+        setBlocks([]);
+        setCaptureSize(null);
+      }
+    };
+    poll();
+    // Lighter cadence than the 150ms hotkey poll - this drives passive
+    // display refresh, not button-press responsiveness.
+    const timer = window.setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  if (!captureSize || blocks.length === 0) {
+    return null;
+  }
+
+  return (
+    <>
+      <CompositionRequest level={UIComposition.Notification} />
+      <div
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 8002,
+          pointerEvents: "none",
+        }}
+      >
+        {blocks.map((b) => {
+          const leftPct = (b.bbox.x0 / captureSize.w) * 100;
+          const topPct = (b.bbox.y0 / captureSize.h) * 100;
+          const widthPct = ((b.bbox.x1 - b.bbox.x0) / captureSize.w) * 100;
+          return (
+            <div
+              key={b.id}
+              style={{
+                position: "absolute",
+                left: `${leftPct}%`,
+                top: `${topPct}%`,
+                width: `${widthPct}%`,
+                minWidth: "80px",
+                maxWidth: "42vw",
+                padding: "3px 7px",
+                borderRadius: "4px",
+                background: "rgba(8, 10, 12, 0.86)",
+                color: "#f7f4ee",
+                fontSize: "15px",
+                lineHeight: "19px",
+                fontWeight: 600,
+                textAlign: "center",
+                textShadow: "0 1px 3px rgba(0, 0, 0, 0.85)",
+                boxShadow: "0 4px 14px rgba(0, 0, 0, 0.4)",
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {b.translation}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 function Content() {
   const [status, setStatus] = useState<CaptureStatus | undefined>();
   const [dynamicStatus, setDynamicStatus] = useState<DynamicStatus | undefined>();
@@ -708,6 +816,7 @@ function Content() {
 export default definePlugin(() => {
   const stopHotkeyPolling = startHotkeyPolling();
   routerHook.addGlobalComponent("PlayTranslateHud", () => <GlobalHud />);
+  routerHook.addGlobalComponent("PlayTranslatePositionedOverlay", () => <PositionedOverlay />);
 
   return {
     name: "PlayTranslate",
@@ -717,6 +826,7 @@ export default definePlugin(() => {
     onDismount() {
       stopHotkeyPolling();
       routerHook.removeGlobalComponent("PlayTranslateHud");
+      routerHook.removeGlobalComponent("PlayTranslatePositionedOverlay");
     },
     alwaysRender: true,
   };

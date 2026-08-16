@@ -211,7 +211,16 @@ class DynamicCaptureRunner:
         # (favors substantial dialogue over short incidental UI labels that were
         # picked up in the same discovery/change batch).
         entries.sort(key=lambda e: (-e["last_changed"], -len(e["text"])))
-        payload = {"updated_at": now, "blocks": entries}
+        payload = {
+            "updated_at": now,
+            "blocks": entries,
+            # Bboxes are in these pixel dimensions - the frontend needs them
+            # to convert to percentage-based CSS positioning for the
+            # position-anchored overlay, since the capture resolution isn't
+            # guaranteed to match the panel's actual render size.
+            "capture_width": self.tracker.width if self.tracker else None,
+            "capture_height": self.tracker.height if self.tracker else None,
+        }
         try:
             tmp_path = Path(str(self.args.output) + ".tmp")
             tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -315,7 +324,18 @@ class DynamicCaptureRunner:
         if self.state == "need_discovery":
             self.maybe_discover(raw, width, height)
         elif self.state == "tracking" and self.tracker is not None:
-            changed_ids, stale_ids, scene_changed = self.tracker.update(raw, width, height)
+            changed_ids, pending_ids, stale_ids, scene_changed = self.tracker.update(raw, width, height)
+            for block_id in pending_ids:
+                # Content just started changing (e.g. a scrolling/growing
+                # NORCO-style text box mid-scroll) - the translation we last
+                # showed for this position no longer matches what's on
+                # screen there. Clear it immediately rather than leaving it
+                # up until the new content happens to settle: write_active_
+                # blocks() already excludes entries with no translation, so
+                # this makes the block disappear from the HUD right away.
+                # reocr_block() (below, once it settles) will repopulate it.
+                if block_id in self.block_meta:
+                    self.block_meta[block_id]["translation"] = None
             for block_id in changed_ids:
                 block = self.tracker.blocks.get(block_id)
                 if block is not None:
@@ -350,7 +370,7 @@ class DynamicCaptureRunner:
                 self.tracker.clear()
                 self.block_meta = {}
                 self.state = "need_discovery"
-            if changed_ids or stale_ids:
+            if changed_ids or pending_ids or stale_ids:
                 self.write_active_blocks()
 
         now = time.monotonic()

@@ -92,6 +92,44 @@ class CliEngine:
         return self._ocr.run_tesseract(self._tesseract, image_path, lang, psm, oem)
 
 
+def _bbox_area(bbox):
+    x0, y0, x1, y1 = bbox
+    return max(0, x1 - x0) * max(0, y1 - y0)
+
+
+def _overlap_area(a, b):
+    ox = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    oy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return ox * oy
+
+
+def _drop_contained_groups(groups, containment_ratio=0.6):
+    """Drop groups that are mostly nested inside a larger group's bbox.
+
+    Confirmed live against a real NORCO frame: Tesseract's line detector
+    can emit small duplicate fragments ("vast", "saw an") sitting entirely
+    inside a large paragraph's bbox that already contains that same text -
+    verified by re-running OCR on the identical static image and getting
+    byte-identical output both times, ruling out engine non-determinism.
+    These nested duplicates were the main source of the block set
+    thrashing on that scene: as isolated word-fragments they carry no
+    context, translate to noise, and constantly re-trigger the flaky-block
+    guard. Kept the larger paragraph group (which read correctly and
+    consistently) and drop whatever's mostly inside it, rather than trying
+    to fix Tesseract's segmentation upstream.
+    """
+    ordered = sorted(groups, key=lambda g: -_bbox_area(g["bbox"]))
+    kept = []
+    for g in ordered:
+        area = _bbox_area(g["bbox"])
+        if area <= 0:
+            continue
+        if any(_overlap_area(g["bbox"], k["bbox"]) / area >= containment_ratio for k in kept):
+            continue
+        kept.append(g)
+    return kept
+
+
 def group_lines_into_blocks(lines, vertical_gap_ratio=0.6, horizontal_overlap_ratio=0.3):
     """Merge individual OCR text lines into paragraph-like blocks.
 
@@ -134,6 +172,8 @@ def group_lines_into_blocks(lines, vertical_gap_ratio=0.6, horizontal_overlap_ra
                 break
         else:
             groups.append({"bbox": (x0, y0, x1, y1), "texts": [line["text"]], "confs": [line["conf"]]})
+
+    groups = _drop_contained_groups(groups)
 
     blocks = []
     for group_id, group in enumerate(groups):

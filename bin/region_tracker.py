@@ -13,6 +13,7 @@ Pure Python, no GStreamer/PIL dependency, so it can be driven directly from
 saved frames in tests. Frames are raw BGRx/RGBx buffers (4 bytes/pixel),
 matching capture.py's appsink caps.
 """
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -60,6 +61,7 @@ class TrackedBlock:
     armed: bool = True
     pending_change: bool = False
     low_diff_streak: int = 0
+    high_diff_streak: int = 0
     stale_streak: int = 0
     settle_timestamps: list = field(default_factory=list)
 
@@ -69,9 +71,11 @@ class MultiRegionTracker:
 
     Call `set_regions()` after a discovery (full-frame OCR) pass, then
     `update()` once per captured raw frame. `update()` returns which blocks
-    changed-and-settled (candidates for targeted re-OCR) and whether the
-    background looks like it went through a sustained scene change (signal
-    to drop all blocks and re-run discovery).
+    changed-and-settled (candidates for targeted re-OCR), which blocks just
+    started changing but haven't settled yet (candidates for immediately
+    hiding a now-stale displayed translation - see update()'s docstring),
+    and whether the background looks like it went through a sustained scene
+    change (signal to drop all blocks and re-run discovery).
     """
 
     def __init__(
@@ -82,6 +86,7 @@ class MultiRegionTracker:
         background_sample_stride=16,
         pixel_diff_threshold=30,
         block_change_threshold=0.12,
+        block_trigger_confirm_count=2,
         block_settle_threshold=0.03,
         block_settle_count=3,
         background_change_threshold=0.15,
@@ -98,6 +103,7 @@ class MultiRegionTracker:
         self.background_sample_stride = background_sample_stride
         self.pixel_diff_threshold = pixel_diff_threshold
         self.block_change_threshold = block_change_threshold
+        self.block_trigger_confirm_count = block_trigger_confirm_count
         self.block_settle_threshold = block_settle_threshold
         self.block_settle_count = block_settle_count
         self.background_change_threshold = background_change_threshold
@@ -158,18 +164,47 @@ class MultiRegionTracker:
         self.background_previous = None
 
     def update(self, raw, width, height):
-        """Feed one raw frame. Returns (changed_block_ids, stale_block_ids, scene_changed)."""
+        """Feed one raw frame. Returns (changed_block_ids, pending_block_ids,
+        stale_block_ids, scene_changed).
+
+        changed_block_ids: settled onto new content - safe to show.
+        pending_block_ids: just started changing this tick, not settled yet -
+          the block's last-shown translation is now stale/unreliable (e.g. a
+          scrolling text box mid-scroll) and callers should hide/invalidate
+          it immediately rather than leaving the old content on screen until
+          the new content happens to settle.
+        """
         changed_block_ids = []
+        pending_block_ids = []
         stale_block_ids = []
 
         for block in self.blocks.values():
             current = _sample(raw, width, height, block.sample_points)
             if block.armed:
                 diff = _diff_ratio(block.baseline, current, self.pixel_diff_threshold)
+                if os.environ.get("PT_DEBUG_DIFF"):
+                    print(f"[diff-debug] block={block.block_id} diff={diff:.4f} text={block.text[:20]!r}", flush=True)
                 if diff >= self.block_change_threshold:
+                    block.high_diff_streak += 1
+                else:
+                    block.high_diff_streak = 0
+                if block.high_diff_streak >= self.block_trigger_confirm_count:
+                    # Require the threshold crossing on consecutive frames,
+                    # not just once - confirmed live that small blocks (few
+                    # sample points, so a handful of noisy pixels swings the
+                    # ratio a lot) can cross block_change_threshold on a
+                    # single-frame blip alone with no real content change
+                    # (seen on a NORCO forum screen: freshly discovered,
+                    # correctly-read post text going straight to '' a
+                    # frame or two later with nothing on screen actually
+                    # different). This also fixes pending_block_ids firing
+                    # too eagerly and flickering the position-anchored
+                    # overlay off on frames that were never a real change.
                     block.armed = False
                     block.pending_change = True
                     block.low_diff_streak = 0
+                    block.high_diff_streak = 0
+                    pending_block_ids.append(block.block_id)
             else:
                 step_diff = _diff_ratio(block.previous, current, self.pixel_diff_threshold)
                 if step_diff <= self.block_settle_threshold:
@@ -241,4 +276,4 @@ class MultiRegionTracker:
         for block_id in stale_block_ids:
             del self.blocks[block_id]
 
-        return changed_block_ids, stale_block_ids, scene_changed
+        return changed_block_ids, pending_block_ids, stale_block_ids, scene_changed

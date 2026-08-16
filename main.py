@@ -395,17 +395,23 @@ class Plugin:
         that engine isn't running yet - callers should fall back to the
         single-region `status().translation` in that case.
         """
+        empty = {"blocks": [], "updated_at": None, "capture_width": None, "capture_height": None}
         try:
             raw = self.active_blocks_path.read_text(encoding="utf-8")
         except (OSError, FileNotFoundError):
-            return {"blocks": [], "updated_at": None}
+            return empty
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return {"blocks": [], "updated_at": None}
+            return empty
         if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
-            return {"blocks": [], "updated_at": None}
-        return {"blocks": data["blocks"], "updated_at": data.get("updated_at")}
+            return empty
+        return {
+            "blocks": data["blocks"],
+            "updated_at": data.get("updated_at"),
+            "capture_width": data.get("capture_width"),
+            "capture_height": data.get("capture_height"),
+        }
 
     def _steam_screenshot_paths(self):
         userdata = Path.home() / ".local" / "share" / "Steam" / "userdata"
@@ -1058,6 +1064,13 @@ class Plugin:
         self.dynamic_log_file.write(f"\n--- PlayTranslate dynamic start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         self.dynamic_log_file.flush()
         env = self._capture_env()
+        # Set PT_DEBUG_DIFF=1 here temporarily when diagnosing tracker
+        # stability live - region_tracker.py logs each block's raw diff
+        # ratio every tick when it's set. This is how the positioned-
+        # overlay capture feedback loop (see PHASE_A_HANDOFF.md) was found:
+        # diff values stayed 0.0000 in an isolated test with nothing
+        # rendering an overlay, then spiked in lockstep across unrelated
+        # blocks the moment the real overlay was actually on screen.
 
         command = [
             "python3",
