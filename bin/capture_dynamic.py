@@ -79,6 +79,26 @@ def is_useful_text(text):
     return len(compact) >= 2
 
 
+def is_probably_name_label(text):
+    """Heuristic: a short, single-word, all-caps token with no sentence
+    punctuation looks like a speaker-name tag ("MIA", "AGATHA"), not a line
+    of dialogue. Confirmed live: translating a bare name through the same
+    dialogue-oriented prompt as real text misfires - translate_server's
+    game-profile context (which documents each character's preferred
+    first-person pronoun *for use inside their dialogue*) got applied to
+    the name itself, so "MIA" came back as "私" instead of staying "MIA".
+    Skipping translation for these is blunter than properly detecting
+    speaker-vs-dialogue blocks and passing the name via the `speaker` field
+    instead, but it's cheap and avoids showing an actively wrong
+    translation for a narrow, easy-to-detect case.
+    """
+    if len(text) > 15 or " " in text:
+        return False
+    if any(ch.islower() for ch in text):
+        return False
+    return not any(ch in ".!?…" for ch in text)
+
+
 def http_post_json(url, payload, timeout=10.0):
     data = json.dumps(payload).encode("utf-8")
     req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
@@ -132,6 +152,8 @@ class DynamicCaptureRunner:
         self.frame_count = 0
         self.temp_dir = Path(tempfile.mkdtemp(prefix="pt_dynamic_"))
         self.last_report = time.monotonic()
+        self.last_discovery_success = time.monotonic()
+        self.started_at = time.monotonic()
         # Per-block metadata not owned by MultiRegionTracker (translation
         # result + timestamps for HUD priority ordering). Keyed by block id,
         # dropped whenever the tracker drops the corresponding block.
@@ -148,6 +170,8 @@ class DynamicCaptureRunner:
         """
         cleaned = normalize_text(text)
         if not is_useful_text(cleaned):
+            return None
+        if is_probably_name_label(cleaned):
             return None
         try:
             result = translate_stub.post_http(self.args.translate_url, "", cleaned, self.args.target_lang)
@@ -197,6 +221,14 @@ class DynamicCaptureRunner:
 
     def maybe_discover(self, raw, width, height):
         now = time.monotonic()
+        if now - self.started_at < self.args.startup_delay:
+            # This process is always started by pressing a QAM button, so
+            # the QAM sidebar is guaranteed to be open at that exact moment
+            # - discovering immediately reliably bakes the sidebar's own
+            # text into the block set (confirmed live), which nothing then
+            # cleans up quickly (see the periodic-rediscover comment above).
+            # Give the user a moment to close it first.
+            return
         if self.discovering or now - self.last_discovery_attempt < self.discovery_min_interval:
             return
         self.last_discovery_attempt = now
@@ -222,6 +254,7 @@ class DynamicCaptureRunner:
                 translation = self.translate_block(b["id"], b["text"])
                 self.block_meta[b["id"]] = {"translation": translation, "last_changed": now}
             self.state = "tracking"
+            self.last_discovery_success = time.monotonic()
             self.write_active_blocks()
         except Exception as exc:
             self.log(f"[discover] failed: {type(exc).__name__}: {exc}")
@@ -240,7 +273,23 @@ class DynamicCaptureRunner:
             self.log(f"[block {block.block_id}] changed: {block.text[:40]!r} -> {new_text[:40]!r}")
             block.text = new_text
             translation = self.translate_block(block.block_id, new_text)
-            self.block_meta[block.block_id] = {"translation": translation, "last_changed": time.time()}
+            prev_meta = self.block_meta.get(block.block_id, {})
+            if translation != prev_meta.get("translation"):
+                # Real content change - this is what HUD priority (most
+                # recently changed first) should actually track.
+                self.block_meta[block.block_id] = {"translation": translation, "last_changed": time.time()}
+            else:
+                # The pixel tracker fired (e.g. a small block like a speaker
+                # name flickering from background noise near its edges,
+                # confirmed live), but re-OCR/re-translate landed back on
+                # the same content. Keep the old last_changed - otherwise a
+                # noisy-but-unchanged block keeps outranking a genuinely
+                # stable, larger dialogue block in the priority queue just
+                # by being noisy, which is exactly backwards.
+                self.block_meta[block.block_id] = {
+                    "translation": translation,
+                    "last_changed": prev_meta.get("last_changed", time.time()),
+                }
         except Exception as exc:
             self.log(f"[block {block.block_id}] re-ocr failed: {type(exc).__name__}: {exc}")
 
@@ -277,6 +326,27 @@ class DynamicCaptureRunner:
                 self.log(f"[track] blocks went stale and were dropped: {stale_ids}")
             if scene_changed:
                 self.log("[track] sustained background change -> dropping all blocks, re-discovering")
+                self.tracker.clear()
+                self.block_meta = {}
+                self.state = "need_discovery"
+            elif time.monotonic() - self.last_discovery_success >= self.args.periodic_rediscover_interval:
+                # Self-healing catch-all, not a primary trigger: scene-change
+                # detection only fires on a *transition* it directly
+                # observes. A block set discovered while something
+                # transient covered the screen (confirmed live: the Decky
+                # QAM overlay) can settle into stable-but-wrong content
+                # before this process's baseline ever captures the change,
+                # so there's nothing left to detect - and a block that
+                # settles once into static garbage and then stops changing
+                # never trips the flaky-block guard either (that needs
+                # *repeated* settling). Forcing a fresh discovery on a
+                # cadence bounds how long any such staleness can persist,
+                # without needing to diagnose which specific trigger missed
+                # it each time.
+                self.log(
+                    f"[track] {self.args.periodic_rediscover_interval:.0f}s since last discovery -> "
+                    "forcing a fresh one as a self-healing check"
+                )
                 self.tracker.clear()
                 self.block_meta = {}
                 self.state = "need_discovery"
@@ -321,6 +391,18 @@ def main():
     parser.add_argument("--lang", default="eng")
     parser.add_argument("--conf-threshold", type=float, default=70.0, help="Discovery confidence cutoff.")
     parser.add_argument("--discovery-min-interval", type=float, default=2.0, help="Seconds between discovery attempts.")
+    parser.add_argument(
+        "--periodic-rediscover-interval",
+        type=float,
+        default=25.0,
+        help="Force a fresh discovery if this many seconds pass without one, even with no detected trigger (self-healing safety net - see on_sample).",
+    )
+    parser.add_argument(
+        "--startup-delay",
+        type=float,
+        default=6.0,
+        help="Seconds to wait before the first discovery attempt, so the QAM sidebar (always open when this process is started) can be closed first.",
+    )
     parser.add_argument("--translate-url", default="http://192.168.1.32:8787/translate", help="Translation HTTP endpoint.")
     parser.add_argument("--target-lang", default="Japanese")
     parser.add_argument("--output", type=Path, help="Write priority-sorted block+translation JSON here after each update.")

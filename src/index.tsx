@@ -3,6 +3,7 @@ import {
   PanelSection,
   PanelSectionRow,
   staticClasses,
+  findAllModules,
 } from "@decky/ui";
 import { callable, definePlugin, routerHook } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
@@ -65,6 +66,61 @@ const translateLatest = callable<[], CaptureStatus>("translate_latest");
 const testHidrawButtonState = callable<[], HidrawTestResult>("test_hidraw_button_state");
 const checkAiServer = callable<[], AiServerStatus>("check_ai_server");
 const getActiveBlocks = callable<[], ActiveBlocksState>("get_active_blocks");
+
+type DynamicStatus = {
+  running: boolean;
+  pid: number | null;
+  returncode: number | null;
+  log_path: string;
+  log_tail: string;
+  blocks: ActiveBlock[];
+  updated_at: number | null;
+  error?: string;
+};
+
+const startDynamicCapture = callable<[], DynamicStatus>("start_dynamic_capture");
+const stopDynamicCapture = callable<[], DynamicStatus>("stop_dynamic_capture");
+const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
+
+/**
+ * Close the QAM sidebar right after starting the dynamic engine, so its own
+ * first discovery pass doesn't bake the sidebar's own text into the block
+ * set (confirmed live - see PHASE_A_HANDOFF.md). `window.Navigation` turned
+ * out to be an unrelated empty function, and SteamClient.UI/Overlay/Window/
+ * Browser/Apps have nothing QAM-visibility-related either (all checked live
+ * via a debug probe once in this codebase's history - see git log around
+ * this comment if that's ever useful again). The real controller is an
+ * already-instantiated singleton found structurally, not by a documented
+ * name: some module holds an object that already has a working
+ * `CloseSideMenus()` method attached (confirmed live: calling it does
+ * close the sidebar). Located via @decky/ui's findAllModules, the same
+ * module-search machinery Composition.tsx already relies on for a similar
+ * "no documented API for this" situation.
+ *
+ * capture_dynamic.py's own startup delay + periodic re-discovery safety net
+ * (see PHASE_A_HANDOFF.md) stay in place regardless, in case this ever
+ * stops finding the instance (e.g. after a Steam UI update renames things).
+ */
+const tryCloseQuickAccessMenu = () => {
+  try {
+    let instance: any;
+    findAllModules((m: any) => {
+      if (instance || typeof m !== "object" || m === null) return false;
+      for (const prop in m) {
+        const val = m[prop];
+        if (val && typeof val === "object" && typeof val.CloseSideMenus === "function") {
+          instance = val;
+          return true;
+        }
+      }
+      return false;
+    });
+    instance?.CloseSideMenus();
+  } catch {
+    // best-effort only - the startup delay + periodic re-discovery in
+    // capture_dynamic.py are the real safety net if this doesn't work.
+  }
+};
 
 /** Dynamic-engine output counts as "live" only within this window - past it,
  * fall back to the single-region pipeline's status().translation so a stale
@@ -164,7 +220,15 @@ function startHotkeyPolling() {
         }
 
         const next = await getStatus();
-        if (!next.error && next.translation && !next.translation_stale) {
+        // next.translation_stale compares last_settled.png's mtime against
+        // the last-translated image - meaningless once the legacy engine
+        // isn't running (e.g. preempted by the dynamic engine's mutual
+        // exclusivity), since no new screenshots ever arrive to diverge
+        // from, so translation_stale stays false forever and an arbitrarily
+        // old cached translation looks perpetually fresh (confirmed live:
+        // this showed a translation from a completely different, much
+        // earlier scene). Require the engine to actually be running too.
+        if (!next.error && next.running && next.translation && !next.translation_stale) {
           showHud(next.translation);
         } else if (!next.error && next.running && !next.translation_in_progress) {
           const translated = await translateLatest();
@@ -351,6 +415,7 @@ function GlobalHud() {
 
 function Content() {
   const [status, setStatus] = useState<CaptureStatus | undefined>();
+  const [dynamicStatus, setDynamicStatus] = useState<DynamicStatus | undefined>();
   const [busy, setBusy] = useState(false);
   const [inputTest, setInputTest] = useState<string>("not tested");
   const [aiStatus, setAiStatus] = useState<string>("not checked");
@@ -360,6 +425,8 @@ function Content() {
   const refresh = async () => {
     const next = await getStatus();
     setStatus(next);
+    const nextDynamic = await getDynamicStatus();
+    setDynamicStatus(nextDynamic);
   };
 
   const runAction = async (action: () => Promise<CaptureStatus>, title: string) => {
@@ -367,6 +434,19 @@ function Content() {
     try {
       const next = await action();
       setStatus(next);
+      if (next.error) {
+        console.warn(`${title}: ${next.error}`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runDynamicAction = async (action: () => Promise<DynamicStatus>, title: string) => {
+    setBusy(true);
+    try {
+      const next = await action();
+      setDynamicStatus(next);
       if (next.error) {
         console.warn(`${title}: ${next.error}`);
       }
@@ -449,6 +529,10 @@ function Content() {
 
   const stateText = status?.running
     ? `Running${status.pid ? ` (${status.pid})` : ""}`
+    : "Stopped";
+
+  const dynamicStateText = dynamicStatus?.running
+    ? `Running${dynamicStatus.pid ? ` (${dynamicStatus.pid})` : ""}`
     : "Stopped";
 
   return (
@@ -553,6 +637,67 @@ function Content() {
           }}
         >
           {status?.error ?? status?.log_tail ?? ""}
+        </pre>
+      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="PlayTranslate — Dynamic (Beta)">
+      <PanelSectionRow>
+        <div>{dynamicStateText}</div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          Wide-area multi-block discovery. Mutually exclusive with regular
+          capture above — starting one stops the other (see
+          PHASE_A_HANDOFF.md).
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy || dynamicStatus?.running === true}
+          layout="below"
+          onClick={() => {
+            runDynamicAction(startDynamicCapture, "PlayTranslate dynamic started");
+            tryCloseQuickAccessMenu();
+          }}
+        >
+          Start Dynamic Capture
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy || dynamicStatus?.running !== true}
+          layout="below"
+          onClick={() => runDynamicAction(stopDynamicCapture, "PlayTranslate dynamic stopped")}
+        >
+          Stop Dynamic Capture
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <pre
+          style={{
+            maxHeight: "160px",
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            fontSize: "12px",
+            lineHeight: "16px",
+          }}
+        >
+          {(dynamicStatus?.blocks ?? [])
+            .map((b) => `#${b.id} ${b.translation || b.text}`)
+            .join("\n") || "(no blocks)"}
+        </pre>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <pre
+          style={{
+            maxHeight: "160px",
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            fontSize: "11px",
+            lineHeight: "14px",
+          }}
+        >
+          {dynamicStatus?.error ?? dynamicStatus?.log_tail ?? ""}
         </pre>
       </PanelSectionRow>
     </PanelSection>

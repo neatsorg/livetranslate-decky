@@ -90,6 +90,7 @@ class MultiRegionTracker:
         block_stale_limit=45,
         flaky_settle_count=3,
         flaky_window_s=10.0,
+        background_pending_timeout_s=15.0,
     ):
         self.width = width
         self.height = height
@@ -105,12 +106,14 @@ class MultiRegionTracker:
         self.block_stale_limit = block_stale_limit
         self.flaky_settle_count = flaky_settle_count
         self.flaky_window_s = flaky_window_s
+        self.background_pending_timeout_s = background_pending_timeout_s
 
         self.blocks = {}  # block_id -> TrackedBlock
         self.background_points = []
         self.background_previous = None
         self.background_pending = False
         self.background_low_diff_streak = 0
+        self.background_pending_since = None
 
     def has_regions(self):
         return len(self.blocks) > 0
@@ -147,6 +150,7 @@ class MultiRegionTracker:
         self.background_previous = _sample(raw, width, height, bg_points)
         self.background_pending = False
         self.background_low_diff_streak = 0
+        self.background_pending_since = None
 
     def clear(self):
         self.blocks = {}
@@ -206,16 +210,32 @@ class MultiRegionTracker:
                 if diff >= self.background_change_threshold:
                     self.background_pending = True
                     self.background_low_diff_streak = 0
+                    self.background_pending_since = time.monotonic()
             else:
                 step_diff = _diff_ratio(self.background_previous, current_bg, self.pixel_diff_threshold)
                 if step_diff <= self.background_settle_threshold:
                     self.background_low_diff_streak += 1
                 else:
                     self.background_low_diff_streak = 0
-                if self.background_low_diff_streak >= self.background_settle_count:
+                timed_out = (
+                    self.background_pending_since is not None
+                    and time.monotonic() - self.background_pending_since >= self.background_pending_timeout_s
+                )
+                if self.background_low_diff_streak >= self.background_settle_count or timed_out:
+                    # A real, confirmed-stable scene change is the common
+                    # case (settle streak completes). The timeout is a
+                    # safety net for games whose background never truly
+                    # holds still (e.g. constant particle/lighting motion
+                    # observed on Enigma of Fear) - without it, a genuine
+                    # scene change (confirmed live: closing the Decky QAM
+                    # overlay) could be detected as "pending" and then never
+                    # confirmed, leaving discovery permanently stuck on
+                    # whatever was on screen when the block set was last
+                    # (re)discovered.
                     scene_changed = True
                     self.background_pending = False
                     self.background_low_diff_streak = 0
+                    self.background_pending_since = None
             self.background_previous = current_bg
 
         for block_id in stale_block_ids:

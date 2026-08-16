@@ -28,6 +28,8 @@ class Plugin:
         self.last_translated_image_mtime_ns = None
         self.ocr_worker_process = None
         self.ocr_worker_log_file = None
+        self.dynamic_process = None
+        self.dynamic_log_file = None
         self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = Path(getattr(decky, "DECKY_PLUGIN_DIR", self.plugin_dir)).parent.parent / "data" / "PlayTranslate"
         self.log_path = self.data_dir / "playtranslate-capture.log"
@@ -36,17 +38,19 @@ class Plugin:
         self.translation_error_path = self.data_dir / "last_translation_error.txt"
         self.translate_url_path = self.data_dir / "translate_url.txt"
         self.active_blocks_path = self.data_dir / "active_blocks.json"
+        self.dynamic_config_path = self.data_dir / "dynamic_config.json"
+        self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
         self.hidraw_path = None
 
     async def _main(self):
         decky.logger.info("PlayTranslate loaded")
 
     async def _unload(self):
-        await self.stop_capture()
+        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture())
         decky.logger.info("PlayTranslate unloaded")
 
     async def _uninstall(self):
-        await self.stop_capture()
+        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture())
 
     def _candidate_engine_dirs(self):
         env_dir = os.environ.get("PLAYTRANSLATE_ENGINE_DIR")
@@ -66,8 +70,18 @@ class Plugin:
                 return engine_dir, capture_py, config_json
         return None, None, None
 
+    def _find_dynamic_capture_script(self):
+        for engine_dir in self._candidate_engine_dirs():
+            script = engine_dir / "capture_dynamic.py"
+            if script.exists():
+                return engine_dir, script
+        return None, None
+
     def _is_running(self):
         return self.process is not None and self.process.poll() is None
+
+    def _is_dynamic_running(self):
+        return self.dynamic_process is not None and self.dynamic_process.poll() is None
 
     def _find_processes_by_script(self, script_path):
         script_path = str(script_path)
@@ -878,6 +892,13 @@ class Plugin:
                 "log_path": str(self.log_path),
             }
 
+        # The dynamic (wide-area) engine and this one open independent
+        # PipeWire consumers on the same gamescope source, which is a
+        # confirmed trigger for the capture freeze cee3705/e2f3e2e recover
+        # from automatically but don't prevent - keep them mutually
+        # exclusive rather than let that happen on every normal start.
+        await self._kill_tracked_dynamic_process()
+
         await self._stop_existing_capture_processes(capture_py)
         self.last_translated_image_mtime_ns = None
         self._clear_translation_outputs()
@@ -970,3 +991,143 @@ class Plugin:
         if capture_py:
             await self._stop_existing_capture_processes(capture_py)
         return await self.status()
+
+    # ── Dynamic (wide-area multi-block) engine — see PHASE_A_HANDOFF.md ────
+    #
+    # capture_dynamic.py, not yet the default: still validated by manually
+    # starting/stopping it here while iterating on discovery/grouping/
+    # tracking quality across different games. Mutually exclusive with the
+    # legacy capture.py (see the note in start_capture()) rather than
+    # something a user would run alongside it.
+
+    def _write_dynamic_config(self):
+        """capture_dynamic.py needs a wide/full-frame capture region, unlike
+        config.json's calibrated subtitle ROI - write a fixed no-crop config
+        for it rather than exposing this as something to hand-tune, since
+        it isn't a per-game setting the way config.json's roi is.
+        """
+        self.dynamic_config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.dynamic_config_path.write_text(
+            json.dumps({"auto_detect": True, "target_object": None, "crop": {"left": 0, "right": 0, "top": 0, "bottom": 0}}),
+            encoding="utf-8",
+        )
+
+    async def _kill_tracked_dynamic_process(self):
+        if not self._is_dynamic_running():
+            return
+        pid = self.dynamic_process.pid
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            for _ in range(20):
+                if self.dynamic_process.poll() is not None:
+                    break
+                await asyncio.sleep(0.1)
+            if self.dynamic_process.poll() is None:
+                os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    async def start_dynamic_capture(self):
+        engine_dir, script = self._find_dynamic_capture_script()
+        if self._is_dynamic_running():
+            if engine_dir:
+                asyncio.create_task(self._ensure_ocr_worker(engine_dir))
+            return await self.dynamic_status()
+
+        if not script:
+            return {
+                "running": False,
+                "error": "capture_dynamic.py was not found in the engine dir.",
+                "log_path": str(self.dynamic_log_path),
+            }
+
+        # See the note in start_capture(): the two engines opening
+        # independent PipeWire consumers on the same source is a confirmed
+        # freeze trigger, so keep them mutually exclusive.
+        await self._kill_tracked_capture_process()
+        await self._stop_existing_capture_processes(engine_dir / "capture.py")
+
+        self._write_dynamic_config()
+        try:
+            self.active_blocks_path.unlink()
+        except FileNotFoundError:
+            pass
+
+        self.dynamic_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.dynamic_log_file = self.dynamic_log_path.open("a", encoding="utf-8")
+        self.dynamic_log_file.write(f"\n--- PlayTranslate dynamic start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        self.dynamic_log_file.flush()
+        env = self._capture_env()
+
+        command = [
+            "python3",
+            str(script),
+            "--config",
+            str(self.dynamic_config_path),
+            "--ocr-worker-url",
+            f"http://127.0.0.1:{self._ocr_worker_port()}",
+            "--translate-url",
+            self._translate_url(),
+            "--output",
+            str(self.active_blocks_path),
+            "--discovery-min-interval",
+            "3",
+            "--report-interval",
+            "8",
+        ]
+
+        try:
+            self.dynamic_process = subprocess.Popen(
+                command,
+                cwd=str(engine_dir),
+                stdout=self.dynamic_log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.dynamic_process = None
+            self.dynamic_log_file.write(f"Failed to start: {exc}\n")
+            self.dynamic_log_file.flush()
+            return {"running": False, "error": str(exc), "log_path": str(self.dynamic_log_path)}
+
+        decky.logger.info(f"Started PlayTranslate dynamic capture pid={self.dynamic_process.pid}")
+        asyncio.create_task(self._ensure_ocr_worker(engine_dir))
+        return await self.dynamic_status()
+
+    async def stop_dynamic_capture(self):
+        await self._kill_tracked_dynamic_process()
+        if self.dynamic_log_file:
+            self.dynamic_log_file.write(f"--- PlayTranslate dynamic stop {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            self.dynamic_log_file.flush()
+            self.dynamic_log_file.close()
+            self.dynamic_log_file = None
+
+        decky.logger.info("Stopped PlayTranslate dynamic capture")
+        _engine_dir, script = self._find_dynamic_capture_script()
+        if script:
+            await self._stop_processes_by_script(script, "dynamic capture")
+        return await self.dynamic_status()
+
+    def _tail_dynamic_log(self, lines=40):
+        if not self.dynamic_log_path.exists():
+            return ""
+        try:
+            text = self.dynamic_log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"Could not read log: {exc}"
+        return "\n".join(text.splitlines()[-lines:])
+
+    async def dynamic_status(self):
+        running = self._is_dynamic_running()
+        active_blocks = await self.get_active_blocks()
+        return {
+            "running": running,
+            "pid": self.dynamic_process.pid if running else None,
+            "returncode": None if running or self.dynamic_process is None else self.dynamic_process.returncode,
+            "log_path": str(self.dynamic_log_path),
+            "log_tail": self._tail_dynamic_log(),
+            "blocks": active_blocks["blocks"],
+            "updated_at": active_blocks["updated_at"],
+        }
