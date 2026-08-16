@@ -145,3 +145,14 @@ Use `--stall-timeout-s 0` to disable. GStreamer `WARNING` bus messages are
 also printed now (previously only `ERROR`/`EOS` were surfaced), so a
 recurrence should show up directly in this script's own log instead of only
 in `journalctl`.
+
+One confirmed trigger for the above: the Deck suspending and resuming mid-session.
+`journalctl -k` shows the whole GPU/PipeWire/USB stack reinitializing on resume
+(`ACPI: PM: Waking up from system sleep state S3` followed by amdgpu/PSP/SMU
+resume messages and a burst of `out of buffers`), and gamescope's PipeWire
+source doesn't reliably recover from that on its own. `capture.py` detects
+this directly - if wall-clock time jumps forward by `--resume-gap-s` (default
+5s) between main-loop iterations, that's a suspend/resume, and it rebuilds the
+pipeline after `--resume-grace-s` (default 3s, to give gamescope a moment to
+stabilize first) instead of waiting on the slower stall watchdog above. Use
+`--resume-gap-s 0` to disable.

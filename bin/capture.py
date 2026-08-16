@@ -525,6 +525,25 @@ def main():
             "frames while frames/fps still look healthy). Use 0 to disable."
         ),
     )
+    parser.add_argument(
+        "--resume-gap-s",
+        type=float,
+        default=5.0,
+        help=(
+            "If wall-clock time jumps forward by at least this much between "
+            "main-loop iterations (which normally poll every ~100ms), treat "
+            "it as a system suspend/resume and rebuild the capture pipeline "
+            "after --resume-grace-s. gamescope's GPU/PipeWire stack has been "
+            "observed not to recover cleanly from suspend on its own. Use 0 "
+            "to disable."
+        ),
+    )
+    parser.add_argument(
+        "--resume-grace-s",
+        type=float,
+        default=3.0,
+        help="Delay before rebuilding the pipeline after a detected resume, to give gamescope time to stabilize first.",
+    )
     args = parser.parse_args()
 
     if args.list_node:
@@ -567,6 +586,8 @@ def main():
     pipeline, bus = start_pipeline(counter)
     started = time.monotonic()
     stall_watchdog_enabled = args.diff and args.stall_timeout_s > 0
+    resume_watchdog_enabled = args.resume_gap_s > 0
+    last_wall_time = time.time()
 
     try:
         while True:
@@ -589,7 +610,23 @@ def main():
                     if debug:
                         print(debug, flush=True)
 
-            if stall_watchdog_enabled and counter.seconds_since_last_change() >= args.stall_timeout_s:
+            now_wall = time.time()
+            wall_gap = now_wall - last_wall_time
+            last_wall_time = now_wall
+
+            if resume_watchdog_enabled and wall_gap >= args.resume_gap_s:
+                print(
+                    f"resume watchdog: wall clock jumped {wall_gap:.0f}s between loop "
+                    f"iterations (likely system suspend/resume) - rebuilding capture "
+                    f"pipeline in {args.resume_grace_s:.0f}s",
+                    flush=True,
+                )
+                time.sleep(args.resume_grace_s)
+                pipeline.set_state(Gst.State.NULL)
+                counter.reset_diff_state()
+                pipeline, bus = start_pipeline(counter)
+                last_wall_time = time.time()
+            elif stall_watchdog_enabled and counter.seconds_since_last_change() >= args.stall_timeout_s:
                 print(
                     f"stall watchdog: no change event for {args.stall_timeout_s:.0f}s "
                     f"(frames={counter.frames} still incrementing) - rebuilding capture pipeline",
