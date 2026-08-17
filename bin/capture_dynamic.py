@@ -79,6 +79,28 @@ def is_useful_text(text):
     return len(compact) >= 2
 
 
+def looks_like_text(text, min_letters=2, min_letter_ratio=0.5):
+    """Same check as ocr_worker.DiscoveryEngine's _looks_like_text (see its
+    docstring) - duplicated here for the same PIL-import-boundary reason as
+    normalize_text() above, not because the logic differs.
+
+    Applying this only in discover_blocks() (ocr_worker.py) isn't enough on
+    its own: reocr_block() below re-OCRs an already-tracked block whenever
+    its pixels change (region_tracker's diff), which on a visually flickery
+    game fires far more often than discovery ever runs - confirmed live
+    that most of the garbage a user actually sees on screen comes from here
+    ('wy' -> 'vr |', '4]' -> 'wy', etc.), not from discovery adding new
+    noise blocks. translate_block() is the one chokepoint both discovery
+    and reocr_block() funnel through before calling the translation LLM, so
+    that's where this gets applied instead of in each caller separately.
+    """
+    letters = sum(1 for ch in text if ch.isalpha())
+    non_space = sum(1 for ch in text if not ch.isspace())
+    if non_space == 0 or letters < min_letters:
+        return False
+    return (letters / non_space) >= min_letter_ratio
+
+
 def is_probably_name_label(text):
     """Heuristic: a short, single-word, all-caps token with no sentence
     punctuation looks like a speaker-name tag ("MIA", "AGATHA"), not a line
@@ -244,6 +266,8 @@ class DynamicCaptureRunner:
         cleaned = normalize_text(text)
         if not is_useful_text(cleaned):
             return None
+        if not looks_like_text(cleaned):
+            return None
         if is_probably_name_label(cleaned):
             return None
         try:
@@ -364,15 +388,35 @@ class DynamicCaptureRunner:
             mask_regions = self._own_overlay_regions()
             snapshot_raw = _mask_regions_bgrx(raw, width, height, mask_regions) if mask_regions else raw
             save_bgrx_crop_png(snapshot_raw, width, height, (0, 0, width, height), snapshot_path, pad=0)
-            result = http_post_json(
-                self.args.ocr_worker_url + "/discover_blocks",
-                {"image": str(snapshot_path), "lang": self.args.lang, "conf_threshold": self.args.conf_threshold},
-            )
+
+            def _discover_at(conf_threshold):
+                result = http_post_json(
+                    self.args.ocr_worker_url + "/discover_blocks",
+                    {
+                        "image": str(snapshot_path),
+                        "lang": self.args.lang,
+                        "conf_threshold": conf_threshold,
+                        "upscale_pct": self.args.discovery_upscale_pct,
+                        "autocontrast": self.args.discovery_autocontrast,
+                    },
+                )
+                self.log(
+                    f"[discover:{reason}] conf>={conf_threshold:.0f} found {len(result['blocks'])} "
+                    f"block(s) in {result['elapsed_s']}s: "
+                    + ", ".join(f"#{b['id']}({b['conf']:.0f}) {b['text'][:30]!r}" for b in result["blocks"])
+                )
+                return result
+
+            result = _discover_at(self.args.conf_threshold)
+            if not result["blocks"] and self.args.conf_threshold_retry < self.args.conf_threshold:
+                # Same discovery attempt (no extra discovery_min_interval
+                # wait), one immediate retry at a looser threshold - this is
+                # what recovers the "70 sometimes misses real text on a
+                # given frame" case the threshold was previously lowered
+                # globally to fix, without paying for that permanently on
+                # every other attempt too.
+                result = _discover_at(self.args.conf_threshold_retry)
             blocks = result["blocks"]
-            self.log(
-                f"[discover:{reason}] found {len(blocks)} block(s) in {result['elapsed_s']}s: "
-                + ", ".join(f"#{b['id']}({b['conf']:.0f}) {b['text'][:30]!r}" for b in blocks)
-            )
             self.last_discovery_success = time.monotonic()
             if not blocks:
                 # Don't touch whatever's currently tracked/displayed - a
@@ -691,15 +735,52 @@ def main():
     parser.add_argument(
         "--conf-threshold",
         type=float,
-        default=60.0,
+        default=70.0,
         help=(
-            "Discovery confidence cutoff. Lowered from 70 - confirmed live that 70 was "
-            "missing real dialogue/title text on some frames (discovery finding 0 blocks "
-            "for one attempt, then the same text again on the next), forcing a wait for "
-            "the next retry. Lower risks pulling in more decorative-glyph noise (dashes/"
-            "equals signs read as short garbage blocks) - is_useful_text()/"
-            "is_probably_name_label() filter some of this, not all."
+            "Discovery confidence cutoff, tried first on every discovery attempt. Was "
+            "lowered to 60 in an earlier session because 70 sometimes missed real "
+            "dialogue/title text on a given frame - but that also pulled in a lot more "
+            "decorative-glyph noise permanently (confirmed live: single-symbol garbage "
+            "blocks like '|', 'A4', 'J)' at conf 60-90). Restored to 70 now that a miss "
+            "at this threshold is handled by an immediate same-attempt retry at "
+            "--conf-threshold-retry instead of permanently lowering the bar - "
+            "see maybe_discover()."
         ),
+    )
+    parser.add_argument(
+        "--conf-threshold-retry",
+        type=float,
+        default=55.0,
+        help=(
+            "Fallback confidence cutoff, tried once immediately (same discovery attempt, "
+            "no extra wait) only when --conf-threshold finds zero blocks. Recovers the "
+            "case --conf-threshold=70 was originally lowered for, without leaving the "
+            "looser threshold in effect on every attempt."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-upscale-pct",
+        type=float,
+        default=130.0,
+        help=(
+            "Upscale full-frame discovery snapshots to this %% before OCR (100 = off). "
+            "Game-agnostic (no fixed per-game threshold, unlike the per-region "
+            "white_text_threshold path) - gives Tesseract more pixels to resolve small "
+            "text against on a full-screen scan."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-autocontrast",
+        dest="discovery_autocontrast",
+        action="store_true",
+        default=True,
+        help="Autocontrast-stretch discovery snapshots before OCR (default on).",
+    )
+    parser.add_argument(
+        "--no-discovery-autocontrast",
+        dest="discovery_autocontrast",
+        action="store_false",
+        help="Disable discovery autocontrast preprocessing.",
     )
     parser.add_argument("--discovery-min-interval", type=float, default=2.0, help="Seconds between discovery attempts.")
     parser.add_argument(

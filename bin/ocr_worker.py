@@ -19,6 +19,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from PIL import Image, ImageOps
+
 try:
     import tesserocr
 except ImportError:
@@ -251,6 +253,53 @@ def group_lines_into_blocks(lines, vertical_gap_ratio=0.8, horizontal_overlap_ra
     return blocks
 
 
+def _looks_like_text(text, min_letters=2, min_letter_ratio=0.5):
+    """Reject OCR lines that are mostly punctuation/symbol noise rather than
+    real words.
+
+    Confirmed live against real Deck discovery logs: full-frame SPARSE_TEXT
+    scanning over busy game art frequently misreads small visual details as
+    short, symbol-heavy "text" ('|', 'A4', 'J)', '\\/', '¥') at
+    deceptively high confidence (60-90) - conf_threshold alone doesn't catch
+    this class of noise, and is_useful_text()'s "2+ alnum chars" bar is too
+    weak to either ("A4", "J)" both pass it). This is a character-composition
+    check instead: real dialogue/UI text is mostly letters, so require a
+    minimum letter count and a minimum letters-to-non-space-chars ratio.
+    Independent of and complementary to conf_threshold - a garbage line can
+    still be individually high-confidence and get rejected here, and a real
+    low-confidence line isn't rescued by looking word-like.
+    """
+    letters = sum(1 for ch in text if ch.isalpha())
+    non_space = sum(1 for ch in text if not ch.isspace())
+    if non_space == 0 or letters < min_letters:
+        return False
+    return (letters / non_space) >= min_letter_ratio
+
+
+def _prepare_discovery_image(image, upscale_pct, autocontrast):
+    """Generic, game-agnostic sharpening for full-frame discovery OCR.
+
+    The per-ROI path (ocr_tesseract.prepare_image) can binarize with a fixed
+    white_text_threshold because a region is calibrated by hand for one
+    known text color/background. Full-frame discovery has no such
+    calibration - text polarity and background busyness vary across the
+    same frame - so this deliberately stays global/parameter-free instead
+    of guessing a per-game threshold: autocontrast stretches whatever
+    contrast the frame already has without assuming polarity, and a modest
+    upscale gives Tesseract more pixels to resolve small text against, the
+    same lever prepare_image() uses (resize) but lighter since this always
+    covers the whole screen instead of one small crop.
+    """
+    image = image.convert("L")
+    if autocontrast:
+        image = ImageOps.autocontrast(image, cutoff=1)
+    if upscale_pct and upscale_pct != 100:
+        width = max(int(image.width * upscale_pct / 100), 1)
+        height = max(int(image.height * upscale_pct / 100), 1)
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return image
+
+
 class DiscoveryEngine:
     """Full-frame sparse-text OCR for dynamic text-block discovery.
 
@@ -278,10 +327,12 @@ class DiscoveryEngine:
             self._apis[lang] = api
         return api
 
-    def discover(self, image_path, lang, conf_threshold):
+    def discover(self, image_path, lang, conf_threshold, upscale_pct=130, autocontrast=True):
         with self._lock:
             api = self._api_for(lang)
-            api.SetImageFile(str(image_path))
+            with Image.open(image_path) as raw_image:
+                prepared = _prepare_discovery_image(raw_image, upscale_pct, autocontrast)
+            api.SetImage(prepared)
             api.Recognize()
             lines = []
             ri = api.GetIterator()
@@ -291,11 +342,31 @@ class DiscoveryEngine:
                     text = ri.GetUTF8Text(level)
                     conf = ri.Confidence(level)
                     bbox = ri.BoundingBox(level)
-                    if text and text.strip() and bbox and conf >= conf_threshold:
-                        lines.append({"text": text.strip(), "conf": conf, "bbox": bbox})
+                    stripped = text.strip() if text else ""
+                    if stripped and bbox and conf >= conf_threshold and _looks_like_text(stripped):
+                        lines.append({"text": stripped, "conf": conf, "bbox": bbox})
                     if not ri.Next(level):
                         break
-            return group_lines_into_blocks(lines)
+            blocks = group_lines_into_blocks(lines)
+            # Line/block bboxes above are in `prepared`'s (possibly upscaled)
+            # pixel space - callers need them in the original capture frame's
+            # space (they crop/mask/track against the raw, non-upscaled
+            # buffer), so scale back down before returning.
+            scale = (upscale_pct or 100) / 100.0
+            if scale != 1.0:
+                for block in blocks:
+                    bbox = block["bbox"]
+                    # Round-trip through int: downstream consumers (pixel
+                    # cropping/masking in capture_dynamic.py) use these in
+                    # range()/buffer-slice math that requires ints, same as
+                    # the un-scaled bboxes they replace.
+                    block["bbox"] = {
+                        "x0": int(bbox["x0"] / scale),
+                        "y0": int(bbox["y0"] / scale),
+                        "x1": int(round(bbox["x1"] / scale)),
+                        "y1": int(round(bbox["y1"] / scale)),
+                    }
+            return blocks
 
 
 class Worker:
@@ -387,14 +458,14 @@ class Worker:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cropped.save(output_path)
 
-    def discover_blocks(self, image_path, lang="eng", conf_threshold=70.0):
+    def discover_blocks(self, image_path, lang="eng", conf_threshold=70.0, upscale_pct=130, autocontrast=True):
         if self.discovery_engine is None:
             raise RuntimeError("discovery requires tesserocr + tessdata (CLI fallback not supported)")
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(str(image_path))
         t0 = time.monotonic()
-        blocks = self.discovery_engine.discover(image_path, lang, conf_threshold)
+        blocks = self.discovery_engine.discover(image_path, lang, conf_threshold, upscale_pct, autocontrast)
         return {"blocks": blocks, "elapsed_s": round(time.monotonic() - t0, 3)}
 
     def translate_image(self, image_path, regions_json, http_url, target_lang):
@@ -527,10 +598,12 @@ class Handler(BaseHTTPRequestHandler):
             image = payload.get("image")
             lang = payload.get("lang", "eng")
             conf_threshold = float(payload.get("conf_threshold", 70.0))
+            upscale_pct = float(payload.get("upscale_pct", 130))
+            autocontrast = bool(payload.get("autocontrast", True))
             if not image:
                 self.send_json(400, {"error": "image is required"})
                 return
-            result = self.server.worker.discover_blocks(image, lang, conf_threshold)
+            result = self.server.worker.discover_blocks(image, lang, conf_threshold, upscale_pct, autocontrast)
             self.send_json(200, result)
         except (FileNotFoundError, ValueError) as exc:
             self.send_json(400, {"error": str(exc)})
