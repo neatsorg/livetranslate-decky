@@ -140,6 +140,74 @@ def save_bgrx_crop_png(raw, width, height, bbox, out_path, pad=4):
     pixbuf.savev(str(out_path), "png", [], [])
 
 
+def _mask_regions_bgrx(raw, width, height, regions):
+    """Return a copy of a raw BGRx frame with each (x0,y0,x1,y1) in
+    `regions` painted solid black.
+
+    Used to blank out PlayTranslate's own on-screen overlay before it gets
+    OCR'd back - confirmed live (screenshot: a discovery_frame.png snapshot
+    showing the positioned overlay's own translated-text boxes rendered on
+    top of the original game text) that gamescope's captured compositor
+    output includes anything drawn on top, including this plugin's own
+    Decky/CEF overlay. The existing suppress() guard in region_tracker.py
+    only protects an already-tracked block's own pixel-diff baseline from
+    this; it does nothing for a fresh full-frame discovery scan or for a
+    re-OCR crop that happens to overlap a *different* block's overlay box.
+    Never mutates `raw` itself - callers still need the true current frame
+    for baseline/diff sampling elsewhere.
+    """
+    masked = bytearray(raw)
+    row_bytes = width * 4
+    for (rx0, ry0, rx1, ry1) in regions:
+        rx0 = max(0, min(rx0, width))
+        rx1 = max(0, min(rx1, width))
+        ry0 = max(0, min(ry0, height))
+        ry1 = max(0, min(ry1, height))
+        if rx1 <= rx0 or ry1 <= ry0:
+            continue
+        blank_row = b"\x00" * ((rx1 - rx0) * 4)
+        for y in range(ry0, ry1):
+            row_start = y * row_bytes + rx0 * 4
+            masked[row_start : row_start + len(blank_row)] = blank_row
+    return masked
+
+
+# Matches PositionedOverlay's own CSS constants (index.tsx: fontSize 12px,
+# lineHeight 15px, padding "3px 7px") - used to estimate how tall its
+# rendered box for a given translation will actually be on screen, since
+# capture_dynamic.py has no visibility into the frontend's real DOM layout.
+_OVERLAY_LINE_HEIGHT_PX = 15
+_OVERLAY_VPADDING_PX = 6  # 3px top + 3px bottom
+_OVERLAY_HPADDING_PX = 14  # 7px left + 7px right
+_OVERLAY_AVG_CHAR_PX = 15  # ~= full-width CJK glyph cell at 12px font/weight 600 -
+# raised from an initial 12px estimate after live measurement (a 57-char
+# Japanese translation in a ~300px-wide box rendered ~3 visual lines, not
+# the ~2 the earlier constant predicted)
+_OVERLAY_SAFETY_MULT = 1.3  # extra margin on top of the char-count estimate
+
+
+def _estimate_overlay_height_px(translation, box_width_px, min_height_px=0):
+    """Deliberately generous, not pixel-exact (real wrapping depends on
+    font metrics/kerning this process can't see) - a masking rectangle
+    that's a bit too tall just hides a bit more of the frame from this
+    one discovery/re-OCR pass, while one that's too short leaves the
+    overlay's own text exposed to OCR again, defeating the point. Confirmed
+    live that even a calibrated-looking char-width estimate can still
+    undershoot real rendered height, so this also takes a floor
+    (`min_height_px`, callers pass the block's own original bbox height)
+    and a blanket safety multiplier on top of the character-count math,
+    rather than trusting the math alone.
+    """
+    if not translation:
+        estimate = _OVERLAY_LINE_HEIGHT_PX + _OVERLAY_VPADDING_PX
+    else:
+        usable_width = max(box_width_px - _OVERLAY_HPADDING_PX, _OVERLAY_AVG_CHAR_PX)
+        chars_per_line = max(1, int(usable_width // _OVERLAY_AVG_CHAR_PX))
+        line_count = max(1, -(-len(translation) // chars_per_line))  # ceil div
+        estimate = line_count * _OVERLAY_LINE_HEIGHT_PX + _OVERLAY_VPADDING_PX
+    return max(int(estimate * _OVERLAY_SAFETY_MULT), min_height_px)
+
+
 class DynamicCaptureRunner:
     def __init__(self, args, config):
         self.args = args
@@ -251,6 +319,32 @@ class DynamicCaptureRunner:
         except OSError as exc:
             self.log(f"[output] failed to write {self.args.output}: {exc}")
 
+    def _own_overlay_regions(self, exclude_block_id=None):
+        """Screen-space rectangles PositionedOverlay is currently rendering
+        translated text into (see _mask_regions_bgrx()'s docstring for why
+        this needs to exist at all). `exclude_block_id` skips a block's own
+        region - reocr_block() wants to mask *other* blocks' overlays that
+        might bleed into its crop, not blank out the very thing it's
+        trying to re-OCR.
+        """
+        regions = []
+        if self.tracker is None:
+            return regions
+        for block_id, meta in self.block_meta.items():
+            if block_id == exclude_block_id:
+                continue
+            translation = meta.get("translation")
+            if not translation:
+                continue
+            block = self.tracker.blocks.get(block_id)
+            if block is None:
+                continue
+            x0, y0, x1, y1 = block.bbox
+            box_width = max(x1 - x0, 80)  # matches PositionedOverlay's CSS minWidth
+            box_height = _estimate_overlay_height_px(translation, box_width, min_height_px=y1 - y0)
+            regions.append((x0, y0, x1, y0 + box_height))
+        return regions
+
     def maybe_discover(self, raw, width, height, reason="periodic"):
         now = time.monotonic()
         if now - self.started_at < self.args.startup_delay:
@@ -267,7 +361,9 @@ class DynamicCaptureRunner:
         self.discovering = True
         try:
             snapshot_path = self.temp_dir / "discovery_frame.png"
-            save_bgrx_crop_png(raw, width, height, (0, 0, width, height), snapshot_path, pad=0)
+            mask_regions = self._own_overlay_regions()
+            snapshot_raw = _mask_regions_bgrx(raw, width, height, mask_regions) if mask_regions else raw
+            save_bgrx_crop_png(snapshot_raw, width, height, (0, 0, width, height), snapshot_path, pad=0)
             result = http_post_json(
                 self.args.ocr_worker_url + "/discover_blocks",
                 {"image": str(snapshot_path), "lang": self.args.lang, "conf_threshold": self.args.conf_threshold},
@@ -296,13 +392,21 @@ class DynamicCaptureRunner:
             # still miss an already-tracked block (confirmed live - see
             # merge_regions()'s docstring for the exact incident), so only
             # genuinely new blocks get added; existing ones (and their
-            # displayed translations) are left alone.
-            added = self.tracker.merge_regions(blocks, raw, width, height)
-            if added:
+            # displayed translations) are left alone - except a block whose
+            # bbox merge_regions() can tell was too small (partial-text
+            # capture that later discovery proves has grown), which it
+            # expands/refines in place instead (also see its docstring).
+            added, updated = self.tracker.merge_regions(blocks, raw, width, height)
+            if added or updated:
                 now = time.time()
-                for block_id, text, _conf in added:
+                for block_id, text, _conf in added + updated:
                     translation = self.translate_block(block_id, text)
                     self.block_meta[block_id] = {"translation": translation, "last_changed": now}
+                if updated:
+                    self.log(
+                        "[discover] expanded previously-partial block(s): "
+                        + ", ".join(f"#{block_id} {text[:30]!r}" for block_id, text, _conf in updated)
+                    )
                 self.write_active_blocks()
             self.state = "tracking"
         except Exception as exc:
@@ -312,13 +416,35 @@ class DynamicCaptureRunner:
 
     def reocr_block(self, block, raw, width, height):
         crop_path = self.temp_dir / f"block_{block.block_id}.png"
-        save_bgrx_crop_png(raw, width, height, block.bbox, crop_path)
+        # Mask *other* blocks' overlay boxes only - not this block's own
+        # (nothing would be left to OCR). Two tracked blocks sitting close
+        # enough for their positioned-overlay boxes to visually collide is
+        # exactly the case PHASE_A_HANDOFF.md's CSS-spacing note flagged;
+        # this stops that collision from also corrupting re-OCR, not just
+        # looking bad on screen.
+        mask_regions = self._own_overlay_regions(exclude_block_id=block.block_id)
+        crop_raw = _mask_regions_bgrx(raw, width, height, mask_regions) if mask_regions else raw
+        save_bgrx_crop_png(crop_raw, width, height, block.bbox, crop_path)
         try:
             result = http_post_json(
                 self.args.ocr_worker_url + "/test_region",
-                {"image": str(crop_path), "region": {"no_crop": True, "psm": 7, "lang": self.args.lang}},
+                # psm 6 ("uniform block of text"), not 7 ("single text
+                # line"): a tracked block's crop can span multiple lines of
+                # the same dialogue (discovery's group_lines_into_blocks()
+                # grouped them together in the first place). psm 7 assumed
+                # exactly one line, so re-OCR after a content change
+                # garbled/truncated any block that started out multi-line -
+                # confirmed via PHASE_A_HANDOFF.md code review. Omitting
+                # "psm" here defers to _ocr_region()'s own default (6).
+                {"image": str(crop_path), "region": {"no_crop": True, "lang": self.args.lang}},
             )
-            new_text = result.get("text", "")
+            # test_region already strips blank lines but keeps "\n" between
+            # real ones (ocr_tesseract.normalize_text) - join with spaces
+            # instead, matching how discover_blocks()/group_lines_into_
+            # blocks() format a multi-line block's text (" ".join(texts)),
+            # so a re-OCR'd block's text stays in the same shape whether it
+            # came from initial discovery or a later content change.
+            new_text = result.get("text", "").replace("\n", " ")
             self.log(f"[block {block.block_id}] changed: {block.text[:40]!r} -> {new_text[:40]!r}")
             block.text = new_text
             translation = self.translate_block(block.block_id, new_text)

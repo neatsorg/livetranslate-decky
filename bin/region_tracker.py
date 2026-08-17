@@ -39,6 +39,11 @@ def _sample(raw, width, height, points):
     return [_pixel_at(raw, width, height, x, y) for (x, y) in points]
 
 
+def _bbox_area(bbox):
+    x0, y0, x1, y1 = bbox
+    return max(1, (x1 - x0) * (y1 - y0))
+
+
 def _bbox_overlap_ratio(a, b):
     """Intersection area relative to the smaller of the two boxes - a
     containment-style overlap check (matches ocr_worker._drop_contained_
@@ -54,9 +59,21 @@ def _bbox_overlap_ratio(a, b):
     inter = iw * ih
     if inter == 0:
         return 0.0
-    area_a = max(1, (ax1 - ax0) * (ay1 - ay0))
-    area_b = max(1, (bx1 - bx0) * (by1 - by0))
-    return inter / min(area_a, area_b)
+    return inter / min(_bbox_area(a), _bbox_area(b))
+
+
+def _containment_ratio(inner, outer):
+    """Fraction of `inner`'s area that sits inside `outer` - directional,
+    unlike _bbox_overlap_ratio's symmetric min-area version. Used to tell
+    "outer fully swallows inner" (a real expansion of inner) apart from
+    "these two boxes happen to overlap a lot" (which _bbox_overlap_ratio
+    alone can't distinguish, since inter/min(area) is the same regardless
+    of which box is bigger).
+    """
+    ix0, iy0 = max(inner[0], outer[0]), max(inner[1], outer[1])
+    ix1, iy1 = min(inner[2], outer[2]), min(inner[3], outer[3])
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    return (iw * ih) / _bbox_area(inner)
 
 
 def _diff_ratio(a, b, pixel_diff_threshold):
@@ -198,10 +215,20 @@ class MultiRegionTracker:
             )
         self._recompute_background(raw, width, height)
 
-    def merge_regions(self, discovered_blocks, raw, width, height, overlap_threshold=0.5):
+    def merge_regions(
+        self,
+        discovered_blocks,
+        raw,
+        width,
+        height,
+        overlap_threshold=0.5,
+        expand_containment_ratio=0.9,
+        expand_growth_ratio=1.2,
+    ):
         """Add newly discovered blocks that don't overlap anything already
         tracked; existing tracked blocks (baseline, armed state, current
-        translation) are left completely untouched.
+        translation) are otherwise left untouched, with one exception (see
+        "expand" below).
 
         Use this for periodic/self-healing rediscovery instead of
         set_regions(). Confirmed live: full-frame OCR confidence is frame-
@@ -214,31 +241,86 @@ class MultiRegionTracker:
         changes within an already-tracked block are the per-block pixel-
         diff tracker's job (see update()), not discovery's.
 
-        Returns [(block_id, text, conf), ...] for the newly added blocks
-        only, so the caller knows what still needs translating.
+        "Expand" exception (added after a live NORCO session found the
+        following): a block first discovered while its text was still
+        partial (e.g. a typewriter-reveal mid-animation, or a message
+        window mid-move) gets tracked with a too-small bbox covering only
+        that partial text - and the pixel-diff tracker only ever samples
+        *inside* that bbox, so it can sit there static and correct-looking
+        forever even after the real on-screen text grows well past it.
+        Plain overlap-skip (the rule above) made this permanent: any later,
+        more-complete rediscovery of the same region always overlaps the
+        stale small bbox enough to be treated as "already tracked" and
+        silently dropped, so the block's bbox/text could never self-heal.
+        Detected via _containment_ratio (directional - is the *old* bbox
+        almost entirely inside the *new* one, not just "these overlap a
+        lot", which alone can't tell an expansion apart from a fragment
+        overlapping a correct block the other way around) plus a minimum
+        growth ratio, so a same-extent rediscovery (jittered a few px) or a
+        smaller/noisy fragment landing inside an already-correct block
+        (the original protection this method exists for) still don't
+        trigger anything. Restricted to exactly one matching existing
+        block - if a new bbox would plausibly expand/absorb more than one
+        already-tracked block at once, that's ambiguous enough (which one
+        keeps the id? are they really the same message?) to leave for a
+        future session and just skip, same as before.
+
+        Returns (added, updated): added is [(block_id, text, conf), ...]
+        for brand-new blocks; updated is [(block_id, text, conf), ...] for
+        existing blocks whose bbox/text were just expanded/refined. Both
+        need translating - the caller doesn't need to treat them
+        differently beyond that.
         """
         added = []
+        updated = []
         for b in discovered_blocks:
             bbox = (b["bbox"]["x0"], b["bbox"]["y0"], b["bbox"]["x1"], b["bbox"]["y1"])
-            if any(_bbox_overlap_ratio(bbox, existing.bbox) >= overlap_threshold for existing in self.blocks.values()):
+            overlapping = [
+                existing for existing in self.blocks.values() if _bbox_overlap_ratio(bbox, existing.bbox) >= overlap_threshold
+            ]
+            if not overlapping:
+                block_id = self._next_block_id
+                self._next_block_id += 1
+                points = _sample_points(*bbox, stride=self.block_sample_stride)
+                baseline = _sample(raw, width, height, points)
+                self.blocks[block_id] = TrackedBlock(
+                    block_id=block_id,
+                    bbox=bbox,
+                    text=b["text"],
+                    conf=b["conf"],
+                    sample_points=points,
+                    baseline=baseline,
+                    previous=baseline,
+                )
+                added.append((block_id, b["text"], b["conf"]))
                 continue
-            block_id = self._next_block_id
-            self._next_block_id += 1
-            points = _sample_points(*bbox, stride=self.block_sample_stride)
-            baseline = _sample(raw, width, height, points)
-            self.blocks[block_id] = TrackedBlock(
-                block_id=block_id,
-                bbox=bbox,
-                text=b["text"],
-                conf=b["conf"],
-                sample_points=points,
-                baseline=baseline,
-                previous=baseline,
-            )
-            added.append((block_id, b["text"], b["conf"]))
-        if added:
+            expandable = [
+                existing
+                for existing in overlapping
+                if _containment_ratio(existing.bbox, bbox) >= expand_containment_ratio
+                and _bbox_area(bbox) >= _bbox_area(existing.bbox) * expand_growth_ratio
+            ]
+            if len(expandable) == 1:
+                existing = expandable[0]
+                points = _sample_points(*bbox, stride=self.block_sample_stride)
+                baseline = _sample(raw, width, height, points)
+                existing.bbox = bbox
+                existing.text = b["text"]
+                existing.conf = b["conf"]
+                existing.sample_points = points
+                existing.baseline = baseline
+                existing.previous = baseline
+                existing.armed = True
+                existing.pending_change = False
+                existing.low_diff_streak = 0
+                existing.high_diff_streak = 0
+                existing.stale_streak = 0
+                existing.settle_timestamps = []
+                existing.suppress_until = 0.0
+                updated.append((existing.block_id, b["text"], b["conf"]))
+        if added or updated:
             self._recompute_background(raw, width, height)
-        return added
+        return added, updated
 
     def _recompute_background(self, raw, width, height):
         occupied = [block.bbox for block in self.blocks.values()]
