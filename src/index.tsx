@@ -71,6 +71,7 @@ const getActiveBlocks = callable<[], ActiveBlocksState>("get_active_blocks");
 
 type DynamicStatus = {
   running: boolean;
+  paused?: boolean;
   pid: number | null;
   returncode: number | null;
   log_path: string;
@@ -80,8 +81,12 @@ type DynamicStatus = {
   error?: string;
 };
 
+type PauseToggleResult = { paused: boolean; error?: string };
+
 const startDynamicCapture = callable<[], DynamicStatus>("start_dynamic_capture");
 const stopDynamicCapture = callable<[], DynamicStatus>("stop_dynamic_capture");
+const refreshDynamicCapture = callable<[], DynamicStatus>("refresh_dynamic_capture");
+const toggleDynamicPause = callable<[], PauseToggleResult>("toggle_dynamic_pause");
 const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
 
 /**
@@ -130,6 +135,12 @@ const tryCloseQuickAccessMenu = () => {
  * HUD showing frozen multi-block data. */
 const ACTIVE_BLOCKS_FRESHNESS_S = 15;
 
+// How long L4 must be held before release counts as a "long press" in
+// Dynamic mode (toggle pause) rather than a short tap (refresh). Comfortably
+// above the 150ms poll interval and the legacy hold-to-show threshold below,
+// so a normal tap can't accidentally register as a long press.
+const DYNAMIC_LONG_PRESS_MS = 900;
+
 function startHotkeyPolling() {
   let hotkeyBusy = false;
   let pollingInput = false;
@@ -138,6 +149,19 @@ function startHotkeyPolling() {
   let l4WasPressed = false;
   let l5WasPressed = false;
   let hudVisible = false;
+  // Whether the dynamic engine process is currently running (regardless of
+  // paused/producing-fresh-blocks) - see PositionedOverlay's dynamic_status
+  // poll, the one place this is tracked continuously (Content's own copy
+  // only updates while the QAM panel is open). While true, L4 completely
+  // changes role: short tap = refresh, long hold = pause/resume, instead of
+  // the legacy hold-to-show/press-to-hide SubtitleHud gestures below. Once
+  // Dynamic mode is the only mode, the legacy branch goes away entirely.
+  let dynamicRunning = false;
+  // Guards the Dynamic-mode long-press from firing more than once per hold
+  // (it fires mid-hold now, not on release - see the dynamicRunning branch
+  // below) and tells release-handling not to also treat the same press as
+  // a short-tap refresh.
+  let dynamicLongPressFired = false;
 
   const showHud = (text: string, blocks?: ActiveBlock[]) => {
     hudVisible = true;
@@ -149,14 +173,25 @@ function startHotkeyPolling() {
     window.dispatchEvent(new CustomEvent("playtranslate-hide-hud"));
   };
 
+  const showToast = (text: string) => {
+    window.dispatchEvent(new CustomEvent("playtranslate-status-toast", { detail: { text } }));
+  };
+
   const handleHudVisible = () => {
     hudVisible = true;
   };
   const handleHudHidden = () => {
     hudVisible = false;
   };
+  const handleDynamicRunningChanged = (event: Event) => {
+    const detail = (event as CustomEvent<{ running?: boolean }>).detail;
+    dynamicRunning = !!detail?.running;
+    holdStart = null;
+    dynamicLongPressFired = false;
+  };
   window.addEventListener("playtranslate-hud-visible", handleHudVisible);
   window.addEventListener("playtranslate-hud-hidden", handleHudHidden);
+  window.addEventListener("playtranslate-dynamic-running-changed", handleDynamicRunningChanged);
 
   const timer = window.setInterval(async () => {
     if (hotkeyBusy || pollingInput) {
@@ -168,6 +203,7 @@ function startHotkeyPolling() {
       const result = await testHidrawButtonState();
       if (!result.success) {
         holdStart = null;
+        dynamicLongPressFired = false;
         showTriggeredForPress = false;
         l4WasPressed = false;
         l5WasPressed = false;
@@ -176,13 +212,61 @@ function startHotkeyPolling() {
 
       // L5: edge-triggered "show the next block" - independent of L4's
       // show/hold handling below, only does anything while the HUD is up.
+      // No Dynamic-mode meaning (yet), so gated off while it's active.
       const l5Pressed = result.buttons.includes("L5");
-      if (l5Pressed && !l5WasPressed && hudVisible) {
+      if (l5Pressed && !l5WasPressed && hudVisible && !dynamicRunning) {
         window.dispatchEvent(new CustomEvent("playtranslate-cycle-hud"));
       }
       l5WasPressed = l5Pressed;
 
       const l4Pressed = result.buttons.includes("L4");
+
+      if (dynamicRunning) {
+        // Long-press fires the instant the hold crosses
+        // DYNAMIC_LONG_PRESS_MS - *while still held*, not on release - so
+        // the toast appears as immediate feedback the user can watch for,
+        // telling them it's safe to let go rather than having to guess how
+        // long is long enough. A short tap (released before the threshold)
+        // fires refresh on release instead.
+        if (l4Pressed && !l4WasPressed) {
+          holdStart = Date.now();
+          dynamicLongPressFired = false;
+        } else if (l4Pressed && l4WasPressed && holdStart !== null && !dynamicLongPressFired) {
+          if (Date.now() - holdStart >= DYNAMIC_LONG_PRESS_MS) {
+            dynamicLongPressFired = true;
+            hotkeyBusy = true;
+            try {
+              const toggled = await toggleDynamicPause();
+              if (toggled.error) {
+                console.warn(`toggle dynamic pause: ${toggled.error}`);
+              } else {
+                showToast(toggled.paused ? "PlayTranslate: paused (release now)" : "PlayTranslate: resumed (release now)");
+              }
+            } finally {
+              hotkeyBusy = false;
+            }
+          }
+        } else if (!l4Pressed && l4WasPressed) {
+          if (holdStart !== null && !dynamicLongPressFired) {
+            hotkeyBusy = true;
+            try {
+              const refreshed = await refreshDynamicCapture();
+              if (refreshed.error) {
+                console.warn(`refresh dynamic capture: ${refreshed.error}`);
+              } else {
+                showToast("PlayTranslate: refreshed");
+              }
+            } finally {
+              hotkeyBusy = false;
+            }
+          }
+          holdStart = null;
+          dynamicLongPressFired = false;
+        }
+        l4WasPressed = l4Pressed;
+        return;
+      }
+
       if (!l4Pressed) {
         holdStart = null;
         showTriggeredForPress = false;
@@ -243,6 +327,7 @@ function startHotkeyPolling() {
       }
     } catch {
       holdStart = null;
+      dynamicLongPressFired = false;
       showTriggeredForPress = false;
       l5WasPressed = false;
     } finally {
@@ -254,6 +339,7 @@ function startHotkeyPolling() {
     window.clearInterval(timer);
     window.removeEventListener("playtranslate-hud-visible", handleHudVisible);
     window.removeEventListener("playtranslate-hud-hidden", handleHudHidden);
+    window.removeEventListener("playtranslate-dynamic-running-changed", handleDynamicRunningChanged);
   };
 }
 
@@ -416,6 +502,75 @@ function GlobalHud() {
 }
 
 /**
+ * Small corner status toast for Dynamic-mode L4 feedback (refresh/pause/
+ * resume) - deliberately separate from SubtitleHud/PositionedOverlay so it
+ * never competes for the same screen space or gets caught up in their
+ * block-list/priority logic. Fire-and-forget: dispatch
+ * "playtranslate-status-toast" with {text, durationMs?} and it shows,
+ * auto-hides, done.
+ */
+function StatusToast() {
+  const [text, setText] = useState("");
+  const [visible, setVisible] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const handleToast = (event: Event) => {
+      const detail = (event as CustomEvent<{ text?: string; durationMs?: number }>).detail;
+      if (!detail?.text) {
+        return;
+      }
+      setText(detail.text);
+      setVisible(true);
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+      timerRef.current = window.setTimeout(() => {
+        setVisible(false);
+        timerRef.current = null;
+      }, detail.durationMs ?? 2000);
+    };
+    window.addEventListener("playtranslate-status-toast", handleToast);
+    return () => {
+      window.removeEventListener("playtranslate-status-toast", handleToast);
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+    };
+  }, []);
+
+  if (!visible) {
+    return null;
+  }
+
+  return (
+    <>
+      <CompositionRequest level={UIComposition.Notification} />
+      <div
+        style={{
+          position: "fixed",
+          top: "3vh",
+          right: "3vw",
+          zIndex: 8004,
+          pointerEvents: "none",
+          padding: "5px 10px",
+          borderRadius: "5px",
+          background: "rgba(8, 10, 12, 0.86)",
+          color: "#f7f4ee",
+          fontSize: "12px",
+          lineHeight: "15px",
+          fontWeight: 600,
+          textShadow: "0 1px 3px rgba(0, 0, 0, 0.85)",
+          boxShadow: "0 4px 14px rgba(0, 0, 0, 0.4)",
+        }}
+      >
+        {text}
+      </div>
+    </>
+  );
+}
+
+/**
  * Real-time translation mode ("option 1" from the block-display design
  * discussion): each currently-valid dynamic-engine block is rendered as its
  * own small overlay positioned at its original on-screen location, instead
@@ -469,6 +624,42 @@ function PositionedOverlay() {
     };
   }, []);
 
+  // Separate from the block poll above: tracks whether the dynamic engine
+  // process itself is running (not whether it currently has fresh blocks -
+  // a paused engine has none, but L4 still needs to be in "Dynamic mode"
+  // to resume it). Only dispatches on an actual change, and only reads
+  // dynamic_status() - this is the one continuously-running poll of it,
+  // since Content's own copy only runs while the QAM panel is mounted.
+  // startHotkeyPolling listens for this to decide whether L4 should use
+  // legacy (SubtitleHud) or Dynamic-mode (refresh/pause) behavior.
+  useEffect(() => {
+    let cancelled = false;
+    let lastRunning: boolean | null = null;
+    const poll = async () => {
+      try {
+        const state = await getDynamicStatus();
+        if (cancelled) return;
+        if (state.running !== lastRunning) {
+          lastRunning = state.running;
+          window.dispatchEvent(
+            new CustomEvent("playtranslate-dynamic-running-changed", { detail: { running: state.running } })
+          );
+        }
+      } catch {
+        if (!cancelled && lastRunning !== false) {
+          lastRunning = false;
+          window.dispatchEvent(new CustomEvent("playtranslate-dynamic-running-changed", { detail: { running: false } }));
+        }
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   if (!captureSize || blocks.length === 0) {
     return null;
   }
@@ -502,10 +693,10 @@ function PositionedOverlay() {
                 borderRadius: "4px",
                 background: "rgba(8, 10, 12, 0.86)",
                 color: "#f7f4ee",
-                fontSize: "15px",
-                lineHeight: "19px",
+                fontSize: "12px",
+                lineHeight: "15px",
                 fontWeight: 600,
-                textAlign: "center",
+                textAlign: "left",
                 textShadow: "0 1px 3px rgba(0, 0, 0, 0.85)",
                 boxShadow: "0 4px 14px rgba(0, 0, 0, 0.4)",
                 whiteSpace: "pre-wrap",
@@ -640,7 +831,7 @@ function Content() {
     : "Stopped";
 
   const dynamicStateText = dynamicStatus?.running
-    ? `Running${dynamicStatus.pid ? ` (${dynamicStatus.pid})` : ""}`
+    ? `Running${dynamicStatus.pid ? ` (${dynamicStatus.pid})` : ""}${dynamicStatus.paused ? " / paused" : ""}`
     : "Stopped";
 
   return (
@@ -781,6 +972,54 @@ function Content() {
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          If the display looks wrong (garbled/overlapping boxes, stuck on
+          old text) and doesn't fix itself in a few seconds, use this -
+          clears what's shown and restarts detection from scratch. Safe to
+          press repeatedly; presses queue instead of interfering with each
+          other.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy || dynamicStatus?.running !== true}
+          layout="below"
+          onClick={() => runDynamicAction(refreshDynamicCapture, "PlayTranslate dynamic refreshed")}
+        >
+          Refresh Dynamic Capture
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          Stops/resumes translation work without restarting the process -
+          use when a noisy scene is producing too much garbled output and
+          you just want it to stop for a while. Also bound to L4 while
+          Dynamic Capture is running: short tap = Refresh above, long hold
+          (~1s) = this.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy || dynamicStatus?.running !== true}
+          layout="below"
+          onClick={async () => {
+            setBusy(true);
+            try {
+              const result = await toggleDynamicPause();
+              if (result.error) {
+                console.warn(`toggle dynamic pause: ${result.error}`);
+              }
+              const next = await getDynamicStatus();
+              setDynamicStatus(next);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {dynamicStatus?.paused ? "Resume Dynamic Capture" : "Pause Dynamic Capture"}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
         <pre
           style={{
             maxHeight: "160px",
@@ -817,6 +1056,7 @@ export default definePlugin(() => {
   const stopHotkeyPolling = startHotkeyPolling();
   routerHook.addGlobalComponent("PlayTranslateHud", () => <GlobalHud />);
   routerHook.addGlobalComponent("PlayTranslatePositionedOverlay", () => <PositionedOverlay />);
+  routerHook.addGlobalComponent("PlayTranslateStatusToast", () => <StatusToast />);
 
   return {
     name: "PlayTranslate",
@@ -827,6 +1067,7 @@ export default definePlugin(() => {
       stopHotkeyPolling();
       routerHook.removeGlobalComponent("PlayTranslateHud");
       routerHook.removeGlobalComponent("PlayTranslatePositionedOverlay");
+      routerHook.removeGlobalComponent("PlayTranslateStatusToast");
     },
     alwaysRender: true,
   };

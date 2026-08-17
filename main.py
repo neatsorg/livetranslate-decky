@@ -30,6 +30,7 @@ class Plugin:
         self.ocr_worker_log_file = None
         self.dynamic_process = None
         self.dynamic_log_file = None
+        self.dynamic_refresh_lock = asyncio.Lock()
         self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = Path(getattr(decky, "DECKY_PLUGIN_DIR", self.plugin_dir)).parent.parent / "data" / "PlayTranslate"
         self.log_path = self.data_dir / "playtranslate-capture.log"
@@ -40,6 +41,7 @@ class Plugin:
         self.active_blocks_path = self.data_dir / "active_blocks.json"
         self.dynamic_config_path = self.data_dir / "dynamic_config.json"
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
+        self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
         self.hidraw_path = None
 
     async def _main(self):
@@ -1058,6 +1060,10 @@ class Plugin:
             self.active_blocks_path.unlink()
         except FileNotFoundError:
             pass
+        try:
+            self.dynamic_pause_flag_path.unlink()
+        except FileNotFoundError:
+            pass
 
         self.dynamic_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.dynamic_log_file = self.dynamic_log_path.open("a", encoding="utf-8")
@@ -1083,6 +1089,8 @@ class Plugin:
             self._translate_url(),
             "--output",
             str(self.active_blocks_path),
+            "--pause-flag",
+            str(self.dynamic_pause_flag_path),
             "--discovery-min-interval",
             "3",
             "--report-interval",
@@ -1123,6 +1131,31 @@ class Plugin:
             await self._stop_processes_by_script(script, "dynamic capture")
         return await self.dynamic_status()
 
+    async def refresh_dynamic_capture(self):
+        """User-facing escape hatch: force a clean restart of the dynamic
+        engine, clearing whatever's currently displayed and re-running
+        full-frame discovery from scratch. For display states the tracker
+        won't self-correct - e.g. a multi-line dialogue box discovered as
+        several independently (mis)translated line fragments, which a
+        fresh discovery pass will very likely reproduce identically since
+        it's a layout issue, not a stale-state issue - the user's own
+        judgement that "this looks wrong" is a better trigger than any
+        heuristic here.
+
+        Serialized by dynamic_refresh_lock so repeated presses queue behind
+        each other's full stop/start cycle instead of interleaving - two
+        overlapping stop+start sequences could otherwise race on
+        self.dynamic_process (e.g. a second start() overwriting the tracked
+        PID while the first stop() is still polling the old one).
+        """
+        async with self.dynamic_refresh_lock:
+            try:
+                self.active_blocks_path.unlink()
+            except FileNotFoundError:
+                pass
+            await self.stop_dynamic_capture()
+            return await self.start_dynamic_capture()
+
     def _tail_dynamic_log(self, lines=40):
         if not self.dynamic_log_path.exists():
             return ""
@@ -1137,6 +1170,7 @@ class Plugin:
         active_blocks = await self.get_active_blocks()
         return {
             "running": running,
+            "paused": self.dynamic_pause_flag_path.exists(),
             "pid": self.dynamic_process.pid if running else None,
             "returncode": None if running or self.dynamic_process is None else self.dynamic_process.returncode,
             "log_path": str(self.dynamic_log_path),
@@ -1144,3 +1178,33 @@ class Plugin:
             "blocks": active_blocks["blocks"],
             "updated_at": active_blocks["updated_at"],
         }
+
+    async def toggle_dynamic_pause(self):
+        """User-facing pause/resume for the dynamic engine's translation
+        work, without stopping/restarting the process itself. Bound to L4
+        long-press while the dynamic engine is running (see index.tsx's
+        startHotkeyPolling), and to the QAM toggle button, for when a
+        wide-area scene is producing too much noisy/garbled output and the
+        user wants it to stop *right now* without waiting on a threshold
+        tune or risking the GStreamer/PipeWire reconnect fragility a full
+        stop+start (refresh_dynamic_capture) would repeat on every toggle
+        (see CAPTURE_STABILITY_HANDOFF.md).
+
+        capture_dynamic.py polls dynamic_pause_flag_path itself (see its
+        on_sample()) and skips all work while it exists, leaving tracked
+        state exactly as it was so resuming continues seamlessly with no
+        fresh discovery needed. This method also blanks active_blocks.json
+        immediately on pause, rather than waiting for the subprocess to
+        notice, so the display clears the instant the user asks for it.
+        """
+        if not self._is_dynamic_running():
+            return {"paused": False, "error": "dynamic engine is not running"}
+        if self.dynamic_pause_flag_path.exists():
+            self.dynamic_pause_flag_path.unlink()
+            return {"paused": False}
+        self.dynamic_pause_flag_path.touch()
+        try:
+            self.active_blocks_path.unlink()
+        except FileNotFoundError:
+            pass
+        return {"paused": True}

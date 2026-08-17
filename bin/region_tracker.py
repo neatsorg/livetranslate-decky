@@ -39,6 +39,26 @@ def _sample(raw, width, height, points):
     return [_pixel_at(raw, width, height, x, y) for (x, y) in points]
 
 
+def _bbox_overlap_ratio(a, b):
+    """Intersection area relative to the smaller of the two boxes - a
+    containment-style overlap check (matches ocr_worker._drop_contained_
+    groups' "mostly inside" heuristic) rather than strict IoU, since OCR
+    bbox edges can shift a few pixels between discovery passes for what's
+    really the same on-screen text.
+    """
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    area_a = max(1, (ax1 - ax0) * (ay1 - ay0))
+    area_b = max(1, (bx1 - bx0) * (by1 - by0))
+    return inter / min(area_a, area_b)
+
+
 def _diff_ratio(a, b, pixel_diff_threshold):
     if not a or len(a) != len(b):
         return 0.0
@@ -64,6 +84,7 @@ class TrackedBlock:
     high_diff_streak: int = 0
     stale_streak: int = 0
     settle_timestamps: list = field(default_factory=list)
+    suppress_until: float = 0.0
 
 
 class MultiRegionTracker:
@@ -120,21 +141,50 @@ class MultiRegionTracker:
         self.background_pending = False
         self.background_low_diff_streak = 0
         self.background_pending_since = None
+        # Well above any raw OCR discover_blocks id (which restarts at 0
+        # each call) so merge_regions()'s allocated ids never collide with
+        # a later set_regions() call's ids.
+        self._next_block_id = 100000
 
     def has_regions(self):
         return len(self.blocks) > 0
 
+    def suppress(self, block_id, duration_s):
+        """Freeze diff-tracking on one block for `duration_s` seconds.
+
+        Call this whenever a caller is about to change what's rendered at
+        this block's bbox by means other than the tracked game content
+        itself (e.g. PlayTranslate's own overlay showing/hiding/updating
+        text there). Without this, that self-caused pixel change is
+        indistinguishable from a real content change and re-triggers
+        tracking, which re-triggers the display, forever - the positioned-
+        overlay feedback loop documented in PHASE_A_HANDOFF.md. While
+        suppressed, the block continuously re-baselines to whatever's
+        currently on screen instead of diffing against a stale baseline, so
+        it resumes clean the moment the window ends regardless of how the
+        overlay actually transitioned in the meantime.
+        """
+        block = self.blocks.get(block_id)
+        if block is not None:
+            block.suppress_until = time.monotonic() + duration_s
+
     def set_regions(self, discovered_blocks, raw, width, height):
-        """(Re)initialize tracking. `discovered_blocks` is the list returned by
-        ocr_worker's /discover_blocks: [{id, text, conf, bbox: {x0,y0,x1,y1}}].
-        `raw` is the frame the discovery OCR ran against, used to seed baselines.
+        """(Re)initialize tracking, discarding anything previously tracked.
+        `discovered_blocks` is the list returned by ocr_worker's
+        /discover_blocks: [{id, text, conf, bbox: {x0,y0,x1,y1}}]. `raw` is
+        the frame the discovery OCR ran against, used to seed baselines.
+
+        Only appropriate when the old block set is *known* to be invalid -
+        the very first discovery, or right after a confirmed scene_changed.
+        A periodic/self-healing rediscovery that might simply have missed
+        an already-tracked block on this particular OCR pass should use
+        merge_regions() instead - see its docstring.
         """
         self.width, self.height = width, height
         self.blocks = {}
-        occupied = []
+        self._next_block_id = 100000
         for b in discovered_blocks:
             bbox = (b["bbox"]["x0"], b["bbox"]["y0"], b["bbox"]["x1"], b["bbox"]["y1"])
-            occupied.append(bbox)
             points = _sample_points(*bbox, stride=self.block_sample_stride)
             baseline = _sample(raw, width, height, points)
             self.blocks[b["id"]] = TrackedBlock(
@@ -146,7 +196,52 @@ class MultiRegionTracker:
                 baseline=baseline,
                 previous=baseline,
             )
+        self._recompute_background(raw, width, height)
 
+    def merge_regions(self, discovered_blocks, raw, width, height, overlap_threshold=0.5):
+        """Add newly discovered blocks that don't overlap anything already
+        tracked; existing tracked blocks (baseline, armed state, current
+        translation) are left completely untouched.
+
+        Use this for periodic/self-healing rediscovery instead of
+        set_regions(). Confirmed live: full-frame OCR confidence is frame-
+        flaky - the same static title-card text is found on some discovery
+        passes and missed on others (PHASE_A_HANDOFF.md's positioned-
+        overlay session; the specific miss that motivated this method is in
+        project memory). A rediscovery pass that fails to redetect an
+        already-tracked block must not blank it just because this
+        particular OCR pass didn't happen to find it again - real content
+        changes within an already-tracked block are the per-block pixel-
+        diff tracker's job (see update()), not discovery's.
+
+        Returns [(block_id, text, conf), ...] for the newly added blocks
+        only, so the caller knows what still needs translating.
+        """
+        added = []
+        for b in discovered_blocks:
+            bbox = (b["bbox"]["x0"], b["bbox"]["y0"], b["bbox"]["x1"], b["bbox"]["y1"])
+            if any(_bbox_overlap_ratio(bbox, existing.bbox) >= overlap_threshold for existing in self.blocks.values()):
+                continue
+            block_id = self._next_block_id
+            self._next_block_id += 1
+            points = _sample_points(*bbox, stride=self.block_sample_stride)
+            baseline = _sample(raw, width, height, points)
+            self.blocks[block_id] = TrackedBlock(
+                block_id=block_id,
+                bbox=bbox,
+                text=b["text"],
+                conf=b["conf"],
+                sample_points=points,
+                baseline=baseline,
+                previous=baseline,
+            )
+            added.append((block_id, b["text"], b["conf"]))
+        if added:
+            self._recompute_background(raw, width, height)
+        return added
+
+    def _recompute_background(self, raw, width, height):
+        occupied = [block.bbox for block in self.blocks.values()]
         bg_points = []
         for y in range(0, height, self.background_sample_stride):
             for x in range(0, width, self.background_sample_stride):
@@ -162,6 +257,7 @@ class MultiRegionTracker:
         self.blocks = {}
         self.background_points = []
         self.background_previous = None
+        self._next_block_id = 100000
 
     def update(self, raw, width, height):
         """Feed one raw frame. Returns (changed_block_ids, pending_block_ids,
@@ -177,9 +273,24 @@ class MultiRegionTracker:
         changed_block_ids = []
         pending_block_ids = []
         stale_block_ids = []
+        now_mono = time.monotonic()
 
         for block in self.blocks.values():
             current = _sample(raw, width, height, block.sample_points)
+            if block.suppress_until and now_mono < block.suppress_until:
+                # Own-render guard window (see suppress()) - track the
+                # moving target silently, don't evaluate diffs this tick.
+                if os.environ.get("PT_DEBUG_DIFF"):
+                    print(
+                        f"[diff-debug] block={block.block_id} suppressed ({block.suppress_until - now_mono:.2f}s left)",
+                        flush=True,
+                    )
+                block.baseline = current
+                block.previous = current
+                block.high_diff_streak = 0
+                block.low_diff_streak = 0
+                continue
+            block.suppress_until = 0.0
             if block.armed:
                 diff = _diff_ratio(block.baseline, current, self.pixel_diff_threshold)
                 if os.environ.get("PT_DEBUG_DIFF"):
