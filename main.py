@@ -1119,6 +1119,10 @@ class Plugin:
 
     async def stop_dynamic_capture(self):
         await self._kill_tracked_dynamic_process()
+        try:
+            self.active_blocks_path.unlink()
+        except FileNotFoundError:
+            pass
         if self.dynamic_log_file:
             self.dynamic_log_file.write(f"--- PlayTranslate dynamic stop {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             self.dynamic_log_file.flush()

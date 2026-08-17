@@ -444,7 +444,7 @@ class DynamicCaptureRunner:
                 # with a flush=True write each, likely adding real
                 # per-frame I/O overhead).
                 self.maybe_discover(raw, width, height, reason="self-healing")
-            if changed_ids or pending_ids or stale_ids:
+            if changed_ids or pending_ids or stale_ids or scene_changed:
                 self.write_active_blocks()
 
         now = time.monotonic()
