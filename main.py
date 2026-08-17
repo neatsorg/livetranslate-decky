@@ -42,6 +42,8 @@ class Plugin:
         self.dynamic_config_path = self.data_dir / "dynamic_config.json"
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
         self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
+        self.tap_request_path = self.data_dir / "tap_request.json"
+        self.tap_result_path = self.data_dir / "tap_result.json"
         self.hidraw_path = None
 
     async def _main(self):
@@ -706,6 +708,14 @@ class Plugin:
         buttons_l_masks = {
             "L5": 0x00008000,
             "R5": 0x00010000,
+            # L2's digital soft-pull click, not its analog trigger axis
+            # (that's a separate 16-bit value elsewhere in the report).
+            # Measured live on hardware (not previously documented anywhere
+            # in this repo) by capturing raw hidraw reports while holding
+            # each button and diffing against an idle baseline - confirmed
+            # to fire repeatedly and only while L2 was held, correlated with
+            # the analog trigger axis moving in the same windows.
+            "L2": 0x00000002,
         }
         buttons_h_masks = {
             "L4": 0x00000200,
@@ -1064,6 +1074,14 @@ class Plugin:
             self.dynamic_pause_flag_path.unlink()
         except FileNotFoundError:
             pass
+        try:
+            self.tap_request_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self.tap_result_path.unlink()
+        except FileNotFoundError:
+            pass
 
         self.dynamic_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.dynamic_log_file = self.dynamic_log_path.open("a", encoding="utf-8")
@@ -1091,6 +1109,10 @@ class Plugin:
             str(self.active_blocks_path),
             "--pause-flag",
             str(self.dynamic_pause_flag_path),
+            "--tap-request",
+            str(self.tap_request_path),
+            "--tap-result",
+            str(self.tap_result_path),
             "--discovery-min-interval",
             "3",
             "--report-interval",
@@ -1121,6 +1143,14 @@ class Plugin:
         await self._kill_tracked_dynamic_process()
         try:
             self.active_blocks_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self.tap_request_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self.tap_result_path.unlink()
         except FileNotFoundError:
             pass
         if self.dynamic_log_file:
@@ -1199,7 +1229,13 @@ class Plugin:
         state exactly as it was so resuming continues seamlessly with no
         fresh discovery needed. This method also blanks active_blocks.json
         immediately on pause, rather than waiting for the subprocess to
-        notice, so the display clears the instant the user asks for it.
+        notice, so the display clears the instant the user asks for it -
+        except capture_width/capture_height, which are deliberately
+        preserved rather than wiped: tap-to-translate (request_tap_
+        translate() below) only ever runs while paused, and needs those
+        dimensions to convert a screen tap into capture-pixel coordinates,
+        but the file that normally carries them (active_blocks.json) would
+        otherwise be blank for the entire time tap-to-translate is usable.
         """
         if not self._is_dynamic_running():
             return {"paused": False, "error": "dynamic engine is not running"}
@@ -1208,7 +1244,66 @@ class Plugin:
             return {"paused": False}
         self.dynamic_pause_flag_path.touch()
         try:
-            self.active_blocks_path.unlink()
+            existing = json.loads(self.active_blocks_path.read_text(encoding="utf-8"))
+        except (OSError, FileNotFoundError, json.JSONDecodeError):
+            existing = {}
+        blanked = {
+            "updated_at": None,
+            "blocks": [],
+            "capture_width": existing.get("capture_width"),
+            "capture_height": existing.get("capture_height"),
+        }
+        self.active_blocks_path.write_text(json.dumps(blanked), encoding="utf-8")
+        return {"paused": True}
+
+    async def request_tap_translate(self, x, y):
+        """Tap-to-translate: the frontend's L4+L2-hold + touch-long-press
+        gesture (index.tsx's TapTranslateOverlay) lands here with a tapped
+        point already converted to capture-pixel coordinates. Only valid
+        while the dynamic engine is running *and* paused - enforced both
+        here (so a stray/late call fails fast with a clear reason) and
+        again on the capture_dynamic.py side (handle_tap_request() is only
+        ever invoked from on_sample()'s paused branch), so this can't
+        accidentally compete with live discovery for the same on-screen
+        area.
+
+        Request/response go through a pair of flag files
+        (tap_request_path/tap_result_path) rather than a direct RPC into
+        capture_dynamic.py, matching every other piece of cross-process
+        state in this file (active_blocks.json, dynamic_paused.flag) -
+        that process only reads its own args, no IPC server of its own.
+        """
+        if not self._is_dynamic_running():
+            return {"ok": False, "error": "dynamic engine is not running"}
+        if not self.dynamic_pause_flag_path.exists():
+            return {"ok": False, "error": "dynamic engine is not paused"}
+        try:
+            self.tap_result_path.unlink()
         except FileNotFoundError:
             pass
-        return {"paused": True}
+        try:
+            self.tap_request_path.write_text(json.dumps({"x": int(x), "y": int(y)}), encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        # capture_dynamic.py only services this once per paused frame, so
+        # polling needs to comfortably outlast one frame interval plus
+        # however long a re-OCR+translate HTTP round trip takes (same order
+        # of magnitude as reocr_block()'s existing per-block work).
+        for _ in range(25):
+            await asyncio.sleep(0.2)
+            if self.tap_result_path.exists():
+                break
+        else:
+            return {"ok": False, "error": "timed out waiting for tap result"}
+
+        try:
+            result = json.loads(self.tap_result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            try:
+                self.tap_result_path.unlink()
+            except FileNotFoundError:
+                pass
+        return result

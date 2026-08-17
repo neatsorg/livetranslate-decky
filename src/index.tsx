@@ -7,6 +7,7 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, routerHook } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { FaLanguage } from "react-icons/fa";
 import { CompositionRequest, UIComposition } from "./Composition";
 import { openRegionCalibration } from "./Calibration";
@@ -83,11 +84,21 @@ type DynamicStatus = {
 
 type PauseToggleResult = { paused: boolean; error?: string };
 
+type TapResult = {
+  ok: boolean;
+  matched?: boolean;
+  text?: string;
+  translation?: string;
+  bbox?: { x0: number; y0: number; x1: number; y1: number };
+  error?: string;
+};
+
 const startDynamicCapture = callable<[], DynamicStatus>("start_dynamic_capture");
 const stopDynamicCapture = callable<[], DynamicStatus>("stop_dynamic_capture");
 const refreshDynamicCapture = callable<[], DynamicStatus>("refresh_dynamic_capture");
 const toggleDynamicPause = callable<[], PauseToggleResult>("toggle_dynamic_pause");
 const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
+const requestTapTranslate = callable<[number, number], TapResult>("request_tap_translate");
 
 /**
  * Close the QAM sidebar right after starting the dynamic engine, so its own
@@ -162,6 +173,26 @@ function startHotkeyPolling() {
   // below) and tells release-handling not to also treat the same press as
   // a short-tap refresh.
   let dynamicLongPressFired = false;
+  // Whether the dynamic engine is currently paused (see toggle_dynamic_
+  // pause() in main.py) - sourced from the same continuous dynamic_status
+  // poll as dynamicRunning (PositionedOverlay's effect, below). Tap-to-
+  // translate (L4+L2 hold + touch long-press) is deliberately paused-only
+  // (see the design discussion in PHASE_A_HANDOFF.md/the tap-to-translate
+  // plan) - gating on this here, not just on the capture_dynamic.py side,
+  // means holding L4+L2 while still actively translating just falls
+  // through to L4's normal Dynamic-mode tap/hold behavior below instead of
+  // silently eating touch input for a feature that can't do anything yet.
+  let dynamicPaused = false;
+  // Whether the L4+L2-hold touch-capture overlay (TapTranslateOverlay) is
+  // currently shown - level-tracked (not edge-triggered) since it should
+  // stay active for the whole time both buttons are held, however long
+  // that is.
+  let tapModeActive = false;
+  const setTapModeActive = (active: boolean) => {
+    if (tapModeActive === active) return;
+    tapModeActive = active;
+    window.dispatchEvent(new CustomEvent("playtranslate-tap-mode-changed", { detail: { active } }));
+  };
 
   const showHud = (text: string, blocks?: ActiveBlock[]) => {
     hudVisible = true;
@@ -184,10 +215,12 @@ function startHotkeyPolling() {
     hudVisible = false;
   };
   const handleDynamicRunningChanged = (event: Event) => {
-    const detail = (event as CustomEvent<{ running?: boolean }>).detail;
+    const detail = (event as CustomEvent<{ running?: boolean; paused?: boolean }>).detail;
     dynamicRunning = !!detail?.running;
+    dynamicPaused = !!detail?.paused;
     holdStart = null;
     dynamicLongPressFired = false;
+    setTapModeActive(false);
   };
   window.addEventListener("playtranslate-hud-visible", handleHudVisible);
   window.addEventListener("playtranslate-hud-hidden", handleHudHidden);
@@ -207,6 +240,7 @@ function startHotkeyPolling() {
         showTriggeredForPress = false;
         l4WasPressed = false;
         l5WasPressed = false;
+        setTapModeActive(false);
         return;
       }
 
@@ -222,6 +256,24 @@ function startHotkeyPolling() {
       const l4Pressed = result.buttons.includes("L4");
 
       if (dynamicRunning) {
+        // Tap-to-translate: holding L4+L2 together while paused hands the
+        // touchscreen to TapTranslateOverlay (a long-press-tap there looks
+        // up whatever block capture_dynamic.py has boxed at that point).
+        // Checked first, ahead of L4's own tap/hold handling below, so
+        // holding L2 alongside L4 fully overrides refresh/pause for as
+        // long as the combo is held - releasing either button falls
+        // straight back to normal L4 behavior with no in-progress
+        // tap/hold state left over (see the resets below).
+        const l2Pressed = result.buttons.includes("L2");
+        if (l4Pressed && l2Pressed && dynamicPaused) {
+          setTapModeActive(true);
+          holdStart = null;
+          dynamicLongPressFired = false;
+          l4WasPressed = l4Pressed;
+          return;
+        }
+        setTapModeActive(false);
+
         // Long-press fires the instant the hold crosses
         // DYNAMIC_LONG_PRESS_MS - *while still held*, not on release - so
         // the toast appears as immediate feedback the user can watch for,
@@ -330,6 +382,7 @@ function startHotkeyPolling() {
       dynamicLongPressFired = false;
       showTriggeredForPress = false;
       l5WasPressed = false;
+      setTapModeActive(false);
     } finally {
       pollingInput = false;
     }
@@ -570,6 +623,190 @@ function StatusToast() {
   );
 }
 
+// Long-press threshold for a touchscreen tap to count as "translate this
+// point" while TapTranslateOverlay is active - independent of
+// DYNAMIC_LONG_PRESS_MS above (that one's a button hold, this is a touch
+// gesture), comfortably above an accidental brush of the screen.
+const TAP_LONG_PRESS_MS = 450;
+// Above this many screen pixels of movement, a held touch is treated as a
+// drag/swipe and the pending tap-translate is cancelled - same tap-vs-drag
+// convention as Calibration.tsx's CREATE_DRAG_THRESHOLD_PX.
+const TAP_MOVE_CANCEL_PX = 12;
+
+const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
+
+/**
+ * Touch-capture overlay for tap-to-translate: shown only while the user
+ * holds L4+L2 with the dynamic engine paused (see startHotkeyPolling's
+ * combo check, which dispatches "playtranslate-tap-mode-changed" - the
+ * L4/L2 button-hold logic itself lives there, not here, since that's
+ * already where every other button-driven mode switch is decided).
+ * `pointerEvents: "auto"` here is what's meant to actually claim touch
+ * input away from the running game underneath - **unverified until tested
+ * live on hardware** (every other overlay in this file is deliberately
+ * pointerEvents:"none" for the opposite reason - see the tap-to-translate
+ * design notes). If touches still reach the game while this is showing,
+ * try switching the CompositionRequest level below from Notification to
+ * Overlay (defined in Composition.tsx, currently unused anywhere).
+ *
+ * A long-press-tap (not a plain tap, see TAP_LONG_PRESS_MS) converts the
+ * touch point to capture-pixel coordinates - via the overlay div's own
+ * bounding rect, the same percentage-of-viewport convention
+ * PositionedOverlay already uses in the other direction - and asks
+ * main.py's request_tap_translate() for whatever block capture_dynamic.py
+ * currently has boxed at that point. A match is shown via the existing
+ * bottom HUD (GlobalHud, through the same "playtranslate-show-hud" event
+ * L4's legacy hold-to-show gesture already uses - no new display surface
+ * needed). No match, an unmatched tap, or any error shows a short toast
+ * instead (StatusToast, same as Dynamic mode's refresh/pause feedback).
+ */
+function TapTranslateOverlay() {
+  const [active, setActive] = useState(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const pendingRef = useRef<{ pointerId: number; startX: number; startY: number; timer: number } | null>(null);
+
+  const clearPending = () => {
+    if (pendingRef.current) {
+      window.clearTimeout(pendingRef.current.timer);
+      pendingRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    const handleTapMode = (event: Event) => {
+      const detail = (event as CustomEvent<{ active?: boolean }>).detail;
+      setActive(!!detail?.active);
+    };
+    window.addEventListener("playtranslate-tap-mode-changed", handleTapMode);
+    return () => {
+      window.removeEventListener("playtranslate-tap-mode-changed", handleTapMode);
+      clearPending();
+    };
+  }, []);
+
+  // The combo can release mid-gesture (user lets go of L4/L2 before the
+  // long-press threshold) - don't let a pending timer fire into a
+  // now-hidden overlay.
+  useEffect(() => {
+    if (!active) clearPending();
+  }, [active]);
+
+  const fireTapTranslate = async (clientX: number, clientY: number) => {
+    const rect = overlayRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) return;
+    const xPct = clamp01((clientX - rect.left) / rect.width);
+    const yPct = clamp01((clientY - rect.top) / rect.height);
+    const toast = (text: string) => window.dispatchEvent(new CustomEvent("playtranslate-status-toast", { detail: { text } }));
+    try {
+      const blocksState = await getActiveBlocks();
+      if (!blocksState.capture_width || !blocksState.capture_height) {
+        toast("PlayTranslate: capture size not known yet");
+        return;
+      }
+      const x = Math.round(xPct * blocksState.capture_width);
+      const y = Math.round(yPct * blocksState.capture_height);
+      const result = await requestTapTranslate(x, y);
+      if (!result.ok) {
+        toast(`PlayTranslate: ${result.error ?? "tap failed"}`);
+      } else if (result.matched) {
+        const text = (result.translation || result.text || "").trim();
+        if (text) {
+          window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text } }));
+        } else {
+          toast("PlayTranslate: no text here");
+        }
+      } else {
+        toast("PlayTranslate: no text here");
+      }
+    } catch (error) {
+      toast(`PlayTranslate: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (pendingRef.current) return; // one gesture at a time
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // best-effort - a missed capture just means onPointerMove/Up might
+      // not fire if the touch leaves this element, which can't happen here
+      // anyway (this div covers the full viewport).
+    }
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const timer = window.setTimeout(() => {
+      pendingRef.current = null;
+      fireTapTranslate(startX, startY);
+    }, TAP_LONG_PRESS_MS);
+    pendingRef.current = { pointerId: event.pointerId, startX, startY, timer };
+  };
+
+  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pending = pendingRef.current;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if (Math.hypot(event.clientX - pending.startX, event.clientY - pending.startY) > TAP_MOVE_CANCEL_PX) {
+      clearPending();
+    }
+  };
+
+  const onPointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (pendingRef.current?.pointerId === event.pointerId) {
+      clearPending();
+    }
+  };
+
+  if (!active) {
+    return null;
+  }
+
+  return (
+    <>
+      {/* Notification-level (used by every other overlay in this file)
+          confirmed live NOT to capture touch input - taps still reached the
+          game underneath with nothing here ever receiving a pointer event
+          (no tap_request.json was ever written). Overlay is the only other
+          level this codebase's Composition.tsx exposes, so it's the
+          remaining candidate for actually claiming input priority the way
+          the QAM itself does. */}
+      <CompositionRequest level={UIComposition.Overlay} />
+      <div
+        ref={overlayRef}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerEnd}
+        onPointerCancel={onPointerEnd}
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 8005,
+          pointerEvents: "auto",
+          touchAction: "none",
+          background: "rgba(20, 110, 200, 0.08)",
+          display: "flex",
+          justifyContent: "center",
+        }}
+      >
+        <div
+          style={{
+            marginTop: "3vh",
+            height: "fit-content",
+            padding: "6px 14px",
+            borderRadius: "6px",
+            background: "rgba(8, 10, 12, 0.8)",
+            color: "#f7f4ee",
+            fontSize: "13px",
+            fontWeight: 600,
+            textShadow: "0 1px 3px rgba(0, 0, 0, 0.85)",
+            pointerEvents: "none",
+          }}
+        >
+          PlayTranslate: タップして翻訳
+        </div>
+      </div>
+    </>
+  );
+}
+
 /**
  * Real-time translation mode ("option 1" from the block-display design
  * discussion): each currently-valid dynamic-engine block is rendered as its
@@ -635,20 +872,26 @@ function PositionedOverlay() {
   useEffect(() => {
     let cancelled = false;
     let lastRunning: boolean | null = null;
+    let lastPaused: boolean | null = null;
     const poll = async () => {
       try {
         const state = await getDynamicStatus();
         if (cancelled) return;
-        if (state.running !== lastRunning) {
+        const paused = !!state.paused;
+        if (state.running !== lastRunning || paused !== lastPaused) {
           lastRunning = state.running;
+          lastPaused = paused;
           window.dispatchEvent(
-            new CustomEvent("playtranslate-dynamic-running-changed", { detail: { running: state.running } })
+            new CustomEvent("playtranslate-dynamic-running-changed", { detail: { running: state.running, paused } })
           );
         }
       } catch {
-        if (!cancelled && lastRunning !== false) {
+        if (!cancelled && (lastRunning !== false || lastPaused !== false)) {
           lastRunning = false;
-          window.dispatchEvent(new CustomEvent("playtranslate-dynamic-running-changed", { detail: { running: false } }));
+          lastPaused = false;
+          window.dispatchEvent(
+            new CustomEvent("playtranslate-dynamic-running-changed", { detail: { running: false, paused: false } })
+          );
         }
       }
     };
@@ -999,6 +1242,13 @@ function Content() {
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          While paused, hold L4+L2 and long-press-tap the screen to
+          translate just the block under your finger (shown in the HUD).
+          Touch is only captured for the duration L4+L2 are held.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
         <ButtonItem
           disabled={busy || dynamicStatus?.running !== true}
           layout="below"
@@ -1057,6 +1307,7 @@ export default definePlugin(() => {
   routerHook.addGlobalComponent("PlayTranslateHud", () => <GlobalHud />);
   routerHook.addGlobalComponent("PlayTranslatePositionedOverlay", () => <PositionedOverlay />);
   routerHook.addGlobalComponent("PlayTranslateStatusToast", () => <StatusToast />);
+  routerHook.addGlobalComponent("PlayTranslateTapOverlay", () => <TapTranslateOverlay />);
 
   return {
     name: "PlayTranslate",
@@ -1068,6 +1319,7 @@ export default definePlugin(() => {
       routerHook.removeGlobalComponent("PlayTranslateHud");
       routerHook.removeGlobalComponent("PlayTranslatePositionedOverlay");
       routerHook.removeGlobalComponent("PlayTranslateStatusToast");
+      routerHook.removeGlobalComponent("PlayTranslateTapOverlay");
     },
     alwaysRender: true,
   };

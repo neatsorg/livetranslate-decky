@@ -414,6 +414,77 @@ class DynamicCaptureRunner:
         finally:
             self.discovering = False
 
+    def _find_block_at_point(self, x, y, pad=6):
+        """Which tracked block (if any) a tap-to-translate coordinate landed
+        in - padded slightly since a tap can land a few px outside the exact
+        OCR bbox even when the user is clearly aiming at that block's text.
+        Per the user's own design decision: a tap that matches nothing
+        returns None and the caller does nothing (no ad hoc OCR fallback) -
+        avoids misreading decorative art/UI chrome as dialogue.
+        """
+        if self.tracker is None:
+            return None
+        for block in self.tracker.blocks.values():
+            x0, y0, x1, y1 = block.bbox
+            if x0 - pad <= x <= x1 + pad and y0 - pad <= y <= y1 + pad:
+                return block
+        return None
+
+    def handle_tap_request(self, raw, width, height):
+        """Tap-to-translate: only ever called from on_sample()'s paused
+        branch (see there), so this is the enforcement point for "this
+        feature only works while translation is paused" - not just a
+        frontend-side gate. main.py's request_tap_translate() writes
+        --tap-request with a tapped point (capture-pixel coords, from the
+        frontend's L4+L2-hold + touch-long-press gesture) and polls
+        --tap-result for the response.
+        """
+        if not self.args.tap_request or not self.args.tap_request.exists():
+            return
+        try:
+            payload = json.loads(self.args.tap_request.read_text(encoding="utf-8"))
+            x, y = int(payload["x"]), int(payload["y"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.log(f"[tap] bad request: {exc}")
+            try:
+                self.args.tap_request.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        try:
+            # Unlink immediately, before doing any OCR/translate work below -
+            # a single in-flight request at a time, and this stops the same
+            # request being reprocessed on a later paused frame if this one
+            # takes longer than a frame interval.
+            self.args.tap_request.unlink()
+        except FileNotFoundError:
+            pass
+
+        try:
+            block = self._find_block_at_point(x, y)
+            if block is None:
+                result = {"ok": True, "matched": False}
+            else:
+                self.log(f"[tap] ({x},{y}) matched block {block.block_id}")
+                self.reocr_block(block, raw, width, height)
+                meta = self.block_meta.get(block.block_id, {})
+                result = {
+                    "ok": True,
+                    "matched": True,
+                    "text": block.text,
+                    "translation": meta.get("translation") or "",
+                    "bbox": {"x0": block.bbox[0], "y0": block.bbox[1], "x1": block.bbox[2], "y1": block.bbox[3]},
+                }
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        try:
+            tmp_path = Path(str(self.args.tap_result) + ".tmp")
+            tmp_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(self.args.tap_result)
+        except OSError as exc:
+            self.log(f"[tap] failed to write result: {exc}")
+
     def reocr_block(self, block, raw, width, height):
         crop_path = self.temp_dir / f"block_{block.block_id}.png"
         # Mask *other* blocks' overlay boxes only - not this block's own
@@ -496,6 +567,14 @@ class DynamicCaptureRunner:
             # exactly where it left off. main.py clears active_blocks.json
             # itself when it sets this flag, for instant display feedback -
             # this process doesn't need to do that part.
+            #
+            # Tap-to-translate (L4+L2 hold + touch long-press, see index.tsx)
+            # is serviced here and only here - it's a deliberately paused-
+            # only feature (see the design discussion), and this branch
+            # already still pulls/maps a live raw frame every tick even
+            # while paused, so a tapped block's re-OCR always reads current
+            # pixels, not a stale frame from whenever pause was toggled.
+            self.handle_tap_request(raw, width, height)
             return Gst.FlowReturn.OK
 
         if self.state == "need_discovery":
@@ -642,6 +721,16 @@ def main():
         "--pause-flag",
         type=Path,
         help="If this path exists, skip all discovery/tracking/translation work each frame (see on_sample()). Created/removed by main.py's toggle_dynamic_pause().",
+    )
+    parser.add_argument(
+        "--tap-request",
+        type=Path,
+        help="Tap-to-translate: main.py's request_tap_translate() writes {x,y} (capture-pixel coords) here. Only polled while paused - see on_sample()/handle_tap_request().",
+    )
+    parser.add_argument(
+        "--tap-result",
+        type=Path,
+        help="Tap-to-translate: handle_tap_request() writes its {ok,matched,text,translation,bbox} response here for main.py to read back.",
     )
     parser.add_argument(
         "--overlay-transition-guard-s",
