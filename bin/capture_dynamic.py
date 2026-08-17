@@ -462,9 +462,8 @@ class DynamicCaptureRunner:
         """Which tracked block (if any) a tap-to-translate coordinate landed
         in - padded slightly since a tap can land a few px outside the exact
         OCR bbox even when the user is clearly aiming at that block's text.
-        Per the user's own design decision: a tap that matches nothing
-        returns None and the caller does nothing (no ad hoc OCR fallback) -
-        avoids misreading decorative art/UI chrome as dialogue.
+        A miss falls through to handle_tap_request()'s ad hoc OCR fallback,
+        not a silent no-op - see there.
         """
         if self.tracker is None:
             return None
@@ -473,6 +472,34 @@ class DynamicCaptureRunner:
             if x0 - pad <= x <= x1 + pad and y0 - pad <= y <= y1 + pad:
                 return block
         return None
+
+    def _adhoc_tap_ocr(self, x, y, raw, width, height):
+        """One-shot OCR of a generously-padded crop around a tap point that
+        didn't land in any already-tracked block. Not a general "sweep the
+        whole screen more aggressively" change (see the noise-fix session
+        this follows, which deliberately restored --conf-threshold to 70 -
+        loosening that back up would undo it) - this only fires on a tap,
+        which is a much stronger intent signal than blind full-frame
+        discovery, and the crop itself is small (a dialogue-box-sized
+        region around the tap, not the whole screen). Returns (bbox, text);
+        the caller is responsible for running the result through
+        translate_block()'s existing noise filter before trusting it.
+        """
+        x0 = max(x - self.args.tap_adhoc_half_width, 0)
+        y0 = max(y - self.args.tap_adhoc_half_height, 0)
+        x1 = min(x + self.args.tap_adhoc_half_width, width)
+        y1 = min(y + self.args.tap_adhoc_half_height, height)
+        bbox = (x0, y0, x1, y1)
+        crop_path = self.temp_dir / "tap_adhoc.png"
+        mask_regions = self._own_overlay_regions()
+        crop_raw = _mask_regions_bgrx(raw, width, height, mask_regions) if mask_regions else raw
+        save_bgrx_crop_png(crop_raw, width, height, bbox, crop_path, pad=0)
+        result = http_post_json(
+            self.args.ocr_worker_url + "/test_region",
+            {"image": str(crop_path), "region": {"no_crop": True, "lang": self.args.lang}},
+        )
+        text = result.get("text", "").replace("\n", " ")
+        return bbox, text
 
     def handle_tap_request(self, raw, width, height):
         """Tap-to-translate: only ever called from on_sample()'s paused
@@ -506,9 +533,7 @@ class DynamicCaptureRunner:
 
         try:
             block = self._find_block_at_point(x, y)
-            if block is None:
-                result = {"ok": True, "matched": False}
-            else:
+            if block is not None:
                 self.log(f"[tap] ({x},{y}) matched block {block.block_id}")
                 self.reocr_block(block, raw, width, height)
                 meta = self.block_meta.get(block.block_id, {})
@@ -519,6 +544,8 @@ class DynamicCaptureRunner:
                     "translation": meta.get("translation") or "",
                     "bbox": {"x0": block.bbox[0], "y0": block.bbox[1], "x1": block.bbox[2], "y1": block.bbox[3]},
                 }
+            else:
+                result = self._handle_unmatched_tap(x, y, raw, width, height)
         except Exception as exc:
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -528,6 +555,72 @@ class DynamicCaptureRunner:
             tmp_path.replace(self.args.tap_result)
         except OSError as exc:
             self.log(f"[tap] failed to write result: {exc}")
+
+    def _handle_unmatched_tap(self, x, y, raw, width, height):
+        """A tap that didn't land in any already-tracked block - most often
+        because full-frame discovery hasn't (yet, or ever) picked up that
+        particular text. Rather than a dead end (the user's own framing:
+        stop/resume and Refresh don't help here, since the problem is
+        discovery never found this text at all, not that it's showing
+        something stale), do one ad hoc OCR pass on a crop around the tap.
+
+        translate_block() is the same noise-filtering chokepoint discovery
+        and reocr_block() already funnel through (is_useful_text/
+        looks_like_text/is_probably_name_label - see the noise-fix
+        session), so garbage OCR off decorative art still gets rejected
+        here exactly as it would anywhere else - this doesn't reopen that
+        problem, it just adds one more caller of the same filter.
+
+        On success, the block is registered into the tracker via
+        merge_regions() (the same non-destructive add-only path periodic
+        rediscovery uses) so it's not a one-off answer - the block starts
+        being tracked for real, and will show up in the positioned overlay/
+        HUD/future taps once translation resumes, effectively teaching
+        discovery about a region it missed rather than just answering this
+        one tap and forgetting it.
+        """
+        bbox, raw_text = self._adhoc_tap_ocr(x, y, raw, width, height)
+        translation = self.translate_block(-1, raw_text)
+        if not translation:
+            return {"ok": True, "matched": False}
+
+        if self.tracker is None:
+            self.tracker = MultiRegionTracker(width, height)
+        cleaned = normalize_text(raw_text)
+        added, updated = self.tracker.merge_regions(
+            [{"id": -1, "bbox": {"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]}, "text": cleaned, "conf": 100.0}],
+            raw,
+            width,
+            height,
+        )
+        new_entries = added + updated
+        if not new_entries:
+            # Shouldn't normally happen (_find_block_at_point already found
+            # no match here), but merge_regions()'s overlap check isn't
+            # identical to that padded bbox-containment check - fall back
+            # to just answering the tap without tracking anything new
+            # rather than silently dropping a translation we already have.
+            self.log(f"[tap] ({x},{y}) ad hoc OCR succeeded but merge_regions() found nothing to add: {cleaned[:40]!r}")
+            return {
+                "ok": True,
+                "matched": True,
+                "text": cleaned,
+                "translation": translation,
+                "bbox": {"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+            }
+
+        block_id, text, _conf = new_entries[0]
+        self.block_meta[block_id] = {"translation": translation, "last_changed": time.time()}
+        self.write_active_blocks()
+        block = self.tracker.blocks[block_id]
+        self.log(f"[tap] ({x},{y}) no tracked block - ad hoc OCR found and registered block {block_id}: {text[:40]!r}")
+        return {
+            "ok": True,
+            "matched": True,
+            "text": block.text,
+            "translation": translation,
+            "bbox": {"x0": block.bbox[0], "y0": block.bbox[1], "x1": block.bbox[2], "y1": block.bbox[3]},
+        }
 
     def reocr_block(self, block, raw, width, height):
         crop_path = self.temp_dir / f"block_{block.block_id}.png"
@@ -812,6 +905,23 @@ def main():
         "--tap-result",
         type=Path,
         help="Tap-to-translate: handle_tap_request() writes its {ok,matched,text,translation,bbox} response here for main.py to read back.",
+    )
+    parser.add_argument(
+        "--tap-adhoc-half-width",
+        type=int,
+        default=220,
+        help=(
+            "Half-width in px of the ad hoc OCR crop centered on a tap that missed every "
+            "tracked block (see _handle_unmatched_tap()). First-guess default sized like a "
+            "typical dialogue line, not measured per-game yet - may need live tuning the "
+            "same way vertical_gap_ratio etc. were."
+        ),
+    )
+    parser.add_argument(
+        "--tap-adhoc-half-height",
+        type=int,
+        default=70,
+        help="Half-height in px of the ad hoc OCR crop for an unmatched tap - see --tap-adhoc-half-width.",
     )
     parser.add_argument(
         "--overlay-transition-guard-s",
