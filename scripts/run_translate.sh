@@ -13,6 +13,9 @@ if [[ "${TRANSLATE_URL}" =~ ^https?://[^/]+/?$ ]]; then
   TRANSLATE_URL="${TRANSLATE_URL%/}/translate"
 fi
 
+TARGET_LANG="${PLAYTRANSLATE_TARGET_LANG:-Japanese}"
+SOURCE_LANG="${PLAYTRANSLATE_SOURCE_LANG:-English}"
+
 IMAGE_PATH="${DATA_DIR}/captures/last_settled.png"
 REGIONS_JSON="${PLAYTRANSLATE_REGIONS_JSON:-${ENGINE_DIR}/ocr_regions.enigma_of_fear.json}"
 OCR_SCRIPT="${ENGINE_DIR}/ocr_tesseract.py"
@@ -56,6 +59,8 @@ TRANSLATION="$(
     "${IMAGE_PATH}" \
     --regions-json "${REGIONS_JSON}" \
     --http-url "${TRANSLATE_URL}" \
+    --target-lang "${TARGET_LANG}" \
+    --source-lang "${SOURCE_LANG}" \
     --json-output "${OUTPUT_JSON}" \
     2>>"${DEBUG_LOG}"
 )"

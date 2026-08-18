@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--regions-json", type=Path, required=True, help="OCR region JSON.")
     parser.add_argument("--http-url", required=True, help="Translation HTTP endpoint.")
     parser.add_argument("--target-lang", default="Japanese", help="Target translation language.")
+    parser.add_argument("--source-lang", default="English", help="Source language.")
     parser.add_argument("--ocr-script", type=Path, default=Path(__file__).with_name("ocr_tesseract.py"))
     parser.add_argument("--translate-script", type=Path, default=Path(__file__).with_name("translate_stub.py"))
     parser.add_argument("--json-output", type=Path, help="Write full OCR/translation JSON here.")
@@ -74,8 +75,10 @@ def main():
         raise SystemExit("No useful text region found")
 
     t_http_start = time.monotonic()
-    result = translate.post_http(args.http_url, speaker, text, args.target_lang)
+    result = translate.post_http(args.http_url, speaker, text, args.target_lang, source_lang=args.source_lang)
     t_http_end = time.monotonic()
+    if result.get("error"):
+        raise SystemExit(f"translation failed: {result['error']}")
     translation = str(result.get("translation") or "").strip()
 
     timing = {

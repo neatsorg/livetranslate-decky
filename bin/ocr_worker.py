@@ -468,7 +468,7 @@ class Worker:
         blocks = self.discovery_engine.discover(image_path, lang, conf_threshold, upscale_pct, autocontrast)
         return {"blocks": blocks, "elapsed_s": round(time.monotonic() - t0, 3)}
 
-    def translate_image(self, image_path, regions_json, http_url, target_lang):
+    def translate_image(self, image_path, regions_json, http_url, target_lang, source_lang="English"):
         t_start = time.monotonic()
         image_path = Path(image_path)
         if not image_path.exists():
@@ -498,8 +498,19 @@ class Worker:
             raise ValueError("No useful text region found")
 
         t_http_start = time.monotonic()
-        result = self.translate.post_http(http_url, speaker, text, target_lang)
+        result = self.translate.post_http(http_url, speaker, text, target_lang, source_lang=source_lang)
         t_http_end = time.monotonic()
+        if result.get("error"):
+            # Surfaced verbatim (error/error_type) so the Handler can pass it
+            # straight through to main.py instead of collapsing it into a
+            # generic "empty translation" - see _handle_translate below.
+            return {
+                "error": result.get("error"),
+                "error_type": result.get("error_type"),
+                "ocr": ocr_json,
+                "http": result,
+                "url": http_url,
+            }
         translation = str(result.get("translation") or "").strip()
 
         timing = {
@@ -567,10 +578,16 @@ class Handler(BaseHTTPRequestHandler):
             regions_json = payload.get("regions_json")
             http_url = payload.get("http_url")
             target_lang = payload.get("target_lang", "Japanese")
+            source_lang = payload.get("source_lang", "English")
             if not image or not regions_json or not http_url:
                 self.send_json(400, {"error": "image, regions_json, http_url are required"})
                 return
-            result = self.server.worker.translate_image(image, regions_json, http_url, target_lang)
+            result = self.server.worker.translate_image(
+                image, regions_json, http_url, target_lang, source_lang=source_lang
+            )
+            if result.get("error"):
+                self.send_json(502, {"error": result["error"], "error_type": result.get("error_type")})
+                return
             self.send_json(200, result)
         except (FileNotFoundError, ValueError) as exc:
             self.send_json(400, {"error": str(exc)})

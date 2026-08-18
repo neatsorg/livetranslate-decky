@@ -1,7 +1,9 @@
 import {
   ButtonItem,
+  DropdownItem,
   PanelSection,
   PanelSectionRow,
+  TextField,
   staticClasses,
   findAllModules,
 } from "@decky/ui";
@@ -29,8 +31,45 @@ type CaptureStatus = {
   last_settled_mtime_ns?: number | null;
   last_translated_image_mtime_ns?: number | null;
   translation_stale?: boolean;
+  translation_engine?: string;
+  translate_server_running?: boolean;
+  translate_server_pid?: number | null;
   error?: string;
 };
+
+type EngineConfig = {
+  api_key?: string;
+  model?: string;
+};
+
+type TranslationSettings = {
+  engine: string;
+  source_lang: string;
+  target_lang: string;
+  ollama: EngineConfig;
+  gemini: EngineConfig;
+  google: EngineConfig;
+  google_cloud: EngineConfig;
+  deepl: EngineConfig;
+};
+
+const ENGINE_OPTIONS = [
+  { data: "ollama", label: "Ollama (LAN server)" },
+  { data: "gemini", label: "Gemini" },
+  { data: "google", label: "Google Translate (free)" },
+  { data: "google_cloud", label: "Google Cloud Translation (paid, API key)" },
+  { data: "deepl", label: "DeepL" },
+];
+
+const LANGUAGE_OPTIONS = [
+  { data: "English", label: "English" },
+  { data: "Japanese", label: "Japanese" },
+  { data: "Korean", label: "Korean" },
+  { data: "Chinese", label: "Chinese" },
+  { data: "Spanish", label: "Spanish" },
+  { data: "French", label: "French" },
+  { data: "German", label: "German" },
+];
 
 type AiServerStatus = {
   ok: boolean;
@@ -69,6 +108,10 @@ const translateLatest = callable<[], CaptureStatus>("translate_latest");
 const testHidrawButtonState = callable<[], HidrawTestResult>("test_hidraw_button_state");
 const checkAiServer = callable<[], AiServerStatus>("check_ai_server");
 const getActiveBlocks = callable<[], ActiveBlocksState>("get_active_blocks");
+const getTranslationSettings = callable<[], TranslationSettings>("get_translation_settings");
+const setTranslationSettings = callable<[Partial<TranslationSettings>], TranslationSettings>(
+  "set_translation_settings"
+);
 
 type DynamicStatus = {
   running: boolean;
@@ -963,6 +1006,40 @@ function Content() {
   const [aiStatus, setAiStatus] = useState<string>("not checked");
   const [hudVisible, setHudVisible] = useState(false);
   const hudTimerRef = useRef<number | null>(null);
+  const [activeTab, setActiveTab] = useState("main");
+  const [translationSettings, setTranslationSettingsState] = useState<TranslationSettings | undefined>();
+  const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [geminiModelInput, setGeminiModelInput] = useState("");
+  const [deeplKeyInput, setDeeplKeyInput] = useState("");
+  const [googleCloudKeyInput, setGoogleCloudKeyInput] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const settings = await getTranslationSettings();
+      setTranslationSettingsState(settings);
+      setGeminiKeyInput(settings.gemini?.api_key ?? "");
+      setGeminiModelInput(settings.gemini?.model ?? "gemini-3.6-flash");
+      setDeeplKeyInput(settings.deepl?.api_key ?? "");
+      setGoogleCloudKeyInput(settings.google_cloud?.api_key ?? "");
+    })();
+  }, []);
+
+  const applyTranslationSettings = async (patch: Partial<TranslationSettings>) => {
+    const next = await setTranslationSettings(patch);
+    setTranslationSettingsState(next);
+  };
+
+  const commitGeminiConfig = () => {
+    applyTranslationSettings({ gemini: { api_key: geminiKeyInput, model: geminiModelInput || "gemini-3.6-flash" } });
+  };
+
+  const commitDeeplConfig = () => {
+    applyTranslationSettings({ deepl: { api_key: deeplKeyInput } });
+  };
+
+  const commitGoogleCloudConfig = () => {
+    applyTranslationSettings({ google_cloud: { api_key: googleCloudKeyInput } });
+  };
 
   const refresh = async () => {
     const next = await getStatus();
@@ -1077,7 +1154,7 @@ function Content() {
     ? `Running${dynamicStatus.pid ? ` (${dynamicStatus.pid})` : ""}${dynamicStatus.paused ? " / paused" : ""}`
     : "Stopped";
 
-  return (
+  const mainTabContent = (
     <>
     <PanelSection title="PlayTranslate">
       <PanelSectionRow>
@@ -1300,10 +1377,216 @@ function Content() {
     </PanelSection>
     </>
   );
+
+  const translationTabContent = (
+    <>
+    <PanelSection title="Translation Engine">
+      <PanelSectionRow>
+        <DropdownItem
+          label="Engine"
+          rgOptions={ENGINE_OPTIONS}
+          selectedOption={translationSettings?.engine ?? "ollama"}
+          onChange={(option) => applyTranslationSettings({ engine: String(option.data) })}
+        />
+      </PanelSectionRow>
+      {translationSettings?.engine === "gemini" && (
+        <>
+          <PanelSectionRow>
+            <TextField
+              label="Gemini API Key"
+              bIsPassword
+              value={geminiKeyInput}
+              onChange={(e) => setGeminiKeyInput(e.target.value)}
+              onBlur={commitGeminiConfig}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <TextField
+              label="Gemini Model"
+              value={geminiModelInput}
+              onChange={(e) => setGeminiModelInput(e.target.value)}
+              onBlur={commitGeminiConfig}
+            />
+          </PanelSectionRow>
+        </>
+      )}
+      {translationSettings?.engine === "deepl" && (
+        <PanelSectionRow>
+          <TextField
+            label="DeepL API Key"
+            bIsPassword
+            value={deeplKeyInput}
+            onChange={(e) => setDeeplKeyInput(e.target.value)}
+            onBlur={commitDeeplConfig}
+          />
+        </PanelSectionRow>
+      )}
+      {translationSettings?.engine === "google" && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.8 }}>
+            Uses Google's free translation endpoint - no API key needed.
+          </div>
+        </PanelSectionRow>
+      )}
+      {translationSettings?.engine === "google_cloud" && (
+        <>
+          <PanelSectionRow>
+            <TextField
+              label="Google Cloud API Key"
+              bIsPassword
+              value={googleCloudKeyInput}
+              onChange={(e) => setGoogleCloudKeyInput(e.target.value)}
+              onBlur={commitGoogleCloudConfig}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ fontSize: "11px", opacity: 0.8 }}>
+              Needs the Cloud Translation API enabled (with billing set up -
+              it has a free monthly quota) on a Google Cloud project, and an
+              API key from there. Not an LLM, so no "thinking" overhead -
+              should be much faster than Gemini for plain translation.
+            </div>
+          </PanelSectionRow>
+        </>
+      )}
+      {translationSettings?.engine === "ollama" && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.8 }}>
+            Uses the LAN server URL configured via translate_url.txt / PLAYTRANSLATE_TRANSLATE_URL
+            (see AI URL on the Main tab). Unaffected by this screen.
+          </div>
+        </PanelSectionRow>
+      )}
+      {translationSettings && translationSettings.engine !== "ollama" && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.8 }}>
+            Local translate server: {status?.translate_server_running ? "running" : "starting / stopped"}
+          </div>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+    <PanelSection title="Language">
+      <PanelSectionRow>
+        <DropdownItem
+          label="Source Language"
+          rgOptions={LANGUAGE_OPTIONS}
+          selectedOption={translationSettings?.source_lang ?? "English"}
+          onChange={(option) => applyTranslationSettings({ source_lang: String(option.data) })}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DropdownItem
+          label="Target Language"
+          rgOptions={LANGUAGE_OPTIONS}
+          selectedOption={translationSettings?.target_lang ?? "Japanese"}
+          onChange={(option) => applyTranslationSettings({ target_lang: String(option.data) })}
+        />
+      </PanelSectionRow>
+    </PanelSection>
+    </>
+  );
+
+  // @decky/ui's <Tabs> renders its content pane with a height that only
+  // resolves against a percentage/flex-sized ancestor - something Steam's
+  // own QAM tab views get for free but a plugin's `content` root doesn't
+  // provide, so the whole pane (and every PanelSectionRow inside it)
+  // collapsed to a few pixels here (confirmed live via CDP: the actual
+  // content rendered at its full natural height, ~1100px+900px, nested
+  // inside ancestors whose own computed height was ~56px). A plain
+  // state-toggled pair of buttons sidesteps that entirely - no absolute
+  // positioning or percentage-height math involved, just normal document
+  // flow, same as this panel used before tabs were added.
+  return (
+    <>
+      <PanelSection>
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={activeTab === "main"} onClick={() => setActiveTab("main")}>
+            Main
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={activeTab === "translation"} onClick={() => setActiveTab("translation")}>
+            Translation
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+      {activeTab === "main" ? mainTabContent : translationTabContent}
+    </>
+  );
+}
+
+/**
+ * Auto-pause dynamic capture while the QAM sidebar is open, so its own text
+ * (button labels, status lines, whichever tab is showing) doesn't get
+ * discovered and translated as if it were game dialogue - confirmed live
+ * (via CDP) that document.visibilityState on this popup's own window
+ * tracks QAM open/close directly (visible while open, hidden while
+ * closed), so no Steam-internal singleton/module search is needed here,
+ * unlike tryCloseQuickAccessMenu() above.
+ *
+ * Tracks whether *this* listener was the one that paused it, so a pause
+ * the user already set manually (L4 long-hold) before opening the QAM is
+ * left alone on close instead of being force-resumed.
+ */
+// Confirmed live (steam-debug + a log read): dynamic capture discovered the
+// QAM's own engine-dropdown label text (e.g. "Ollama (LAN server)") right
+// after a rapid QAM close - document.visibilityState flips to "hidden"
+// before Steam's own closing animation has actually finished, so an
+// immediate resume can still catch a frame or two of QAM content. Not
+// measured precisely; picked to comfortably clear a normal close animation
+// without making the pause feel sticky.
+const QAM_RESUME_DEBOUNCE_MS = 400;
+
+function startQamPauseSync() {
+  let pausedByThis = false;
+  let resumeTimer: number | null = null;
+
+  const cancelPendingResume = () => {
+    if (resumeTimer !== null) {
+      window.clearTimeout(resumeTimer);
+      resumeTimer = null;
+    }
+  };
+
+  const handleVisibilityChange = async () => {
+    try {
+      if (document.visibilityState === "visible") {
+        // QAM reopened before the debounced resume below fired - it's
+        // still paused, so just cancel the pending resume and stay put.
+        cancelPendingResume();
+        const status = await getDynamicStatus();
+        if (status.running && !status.paused) {
+          const result = await toggleDynamicPause();
+          if (!result.error && result.paused) {
+            pausedByThis = true;
+          }
+        }
+      } else if (pausedByThis) {
+        cancelPendingResume();
+        resumeTimer = window.setTimeout(async () => {
+          resumeTimer = null;
+          pausedByThis = false;
+          const result = await toggleDynamicPause();
+          if (result.error) {
+            console.warn(`QAM auto-resume: ${result.error}`);
+          }
+        }, QAM_RESUME_DEBOUNCE_MS);
+      }
+    } catch (error) {
+      console.warn(`QAM pause sync: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  return () => {
+    cancelPendingResume();
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
+  };
 }
 
 export default definePlugin(() => {
   const stopHotkeyPolling = startHotkeyPolling();
+  const stopQamPauseSync = startQamPauseSync();
   routerHook.addGlobalComponent("PlayTranslateHud", () => <GlobalHud />);
   routerHook.addGlobalComponent("PlayTranslatePositionedOverlay", () => <PositionedOverlay />);
   routerHook.addGlobalComponent("PlayTranslateStatusToast", () => <StatusToast />);
@@ -1316,6 +1599,7 @@ export default definePlugin(() => {
     icon: <FaLanguage />,
     onDismount() {
       stopHotkeyPolling();
+      stopQamPauseSync();
       routerHook.removeGlobalComponent("PlayTranslateHud");
       routerHook.removeGlobalComponent("PlayTranslatePositionedOverlay");
       routerHook.removeGlobalComponent("PlayTranslateStatusToast");

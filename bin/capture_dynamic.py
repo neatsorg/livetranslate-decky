@@ -266,6 +266,31 @@ class DynamicCaptureRunner:
     def log(self, msg):
         print(msg, flush=True)
 
+    def _resolve_translation_config(self):
+        """(translate_url, target_lang, source_lang), preferring the live
+        overrides in --translation-config when present.
+
+        --translate-url/--target-lang/--source-lang are only this process's
+        *initial* values, frozen at spawn time. main.py can't reach into a
+        running process's argv to change them, so instead it rewrites
+        --translation-config's JSON file (the same file-based signal pattern
+        already used for --pause-flag/--tap-request) whenever translation
+        settings change - re-read here on every call so an engine/language
+        switch takes effect without restarting dynamic capture.
+        """
+        path = self.args.translation_config
+        if path:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return (
+                    data.get("translate_url") or self.args.translate_url,
+                    data.get("target_lang") or self.args.target_lang,
+                    data.get("source_lang") or self.args.source_lang,
+                )
+            except (OSError, ValueError):
+                pass
+        return self.args.translate_url, self.args.target_lang, self.args.source_lang
+
     def translate_block(self, block_id, text):
         """Translate one block's OCR text and update block_meta. Runs
         serially (one HTTP call at a time, same as the existing single-region
@@ -285,8 +310,12 @@ class DynamicCaptureRunner:
         if is_probably_name_label(cleaned):
             return None, None
         t_translate_start = time.monotonic()
+        translate_url, target_lang, source_lang = self._resolve_translation_config()
         try:
-            result = translate_stub.post_http(self.args.translate_url, "", cleaned, self.args.target_lang)
+            result = translate_stub.post_http(translate_url, "", cleaned, target_lang, source_lang=source_lang)
+            if result.get("error"):
+                self.log(f"[block {block_id}] translate failed: {result.get('error_type') or 'error'}: {result['error']}")
+                return None, round(time.monotonic() - t_translate_start, 3)
             return str(result.get("translation") or "").strip(), round(time.monotonic() - t_translate_start, 3)
         except Exception as exc:
             self.log(f"[block {block_id}] translate failed: {type(exc).__name__}: {exc}")
@@ -970,6 +999,18 @@ def main():
     )
     parser.add_argument("--translate-url", default="http://192.168.1.32:8787/translate", help="Translation HTTP endpoint.")
     parser.add_argument("--target-lang", default="Japanese")
+    parser.add_argument("--source-lang", default="English")
+    parser.add_argument(
+        "--translation-config",
+        type=Path,
+        help=(
+            "JSON file with {translate_url, target_lang, source_lang} overrides, "
+            "re-read on every translate_block() call. Written by main.py so an "
+            "engine/language change while this process is already running takes "
+            "effect without a restart; the three flags above are just the initial "
+            "values (and the fallback for standalone/manual runs)."
+        ),
+    )
     parser.add_argument("--output", type=Path, help="Write priority-sorted block+translation JSON here after each update.")
     parser.add_argument(
         "--pause-flag",

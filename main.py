@@ -17,6 +17,18 @@ import decky
 _GAME_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _DEFAULT_GAME_ID = "enigma_of_fear"
 
+_DEFAULT_TRANSLATION_SETTINGS = {
+    "engine": "ollama",
+    "source_lang": "English",
+    "target_lang": "Japanese",
+    "ollama": {},
+    "gemini": {"api_key": "", "model": "gemini-3.6-flash"},
+    "google": {},
+    "google_cloud": {"api_key": ""},
+    "deepl": {"api_key": ""},
+}
+_SENSITIVE_SETTING_KEYS = {"api_key"}
+
 
 class Plugin:
     def __init__(self):
@@ -30,6 +42,8 @@ class Plugin:
         self.ocr_worker_log_file = None
         self.dynamic_process = None
         self.dynamic_log_file = None
+        self.translate_server_process = None
+        self.translate_server_log_file = None
         self.dynamic_refresh_lock = asyncio.Lock()
         self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = Path(getattr(decky, "DECKY_PLUGIN_DIR", self.plugin_dir)).parent.parent / "data" / "PlayTranslate"
@@ -38,23 +52,25 @@ class Plugin:
         self.translation_json_path = self.data_dir / "last_translation.json"
         self.translation_error_path = self.data_dir / "last_translation_error.txt"
         self.translate_url_path = self.data_dir / "translate_url.txt"
+        self.translation_settings_path = self.data_dir / "translation_settings.json"
         self.active_blocks_path = self.data_dir / "active_blocks.json"
         self.dynamic_config_path = self.data_dir / "dynamic_config.json"
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
         self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
         self.tap_request_path = self.data_dir / "tap_request.json"
         self.tap_result_path = self.data_dir / "tap_result.json"
+        self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
         self.hidraw_path = None
 
     async def _main(self):
         decky.logger.info("PlayTranslate loaded")
 
     async def _unload(self):
-        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture())
+        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server())
         decky.logger.info("PlayTranslate unloaded")
 
     async def _uninstall(self):
-        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture())
+        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server())
 
     def _candidate_engine_dirs(self):
         env_dir = os.environ.get("PLAYTRANSLATE_ENGINE_DIR")
@@ -171,6 +187,14 @@ class Plugin:
             return f"Could not read {path.name}: {exc}"
 
     def _translate_url(self):
+        # Cloud engines (google/gemini/deepl) are served by a translate_server.py
+        # this plugin spawns locally on the Deck (see _ensure_translate_server),
+        # so users without their own Ollama LAN server can still translate.
+        # Selecting "ollama" leaves this entirely untouched - same env var /
+        # translate_url.txt / hardcoded-LAN-default resolution as always.
+        if self._load_translation_settings().get("engine") != "ollama":
+            return f"http://127.0.0.1:{self._translate_server_port()}/translate"
+
         env_url = os.environ.get("PLAYTRANSLATE_TRANSLATE_URL")
         if env_url:
             return self._normalize_translate_url(env_url)
@@ -179,6 +203,74 @@ class Plugin:
             if configured:
                 return self._normalize_translate_url(configured)
         return "http://192.168.1.32:8787/translate"
+
+    def _load_translation_settings(self):
+        if not self.translation_settings_path.exists():
+            return json.loads(json.dumps(_DEFAULT_TRANSLATION_SETTINGS))
+        try:
+            data = json.loads(self.translation_settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return json.loads(json.dumps(_DEFAULT_TRANSLATION_SETTINGS))
+        settings = json.loads(json.dumps(_DEFAULT_TRANSLATION_SETTINGS))
+        for key, value in (data or {}).items():
+            if key in settings:
+                settings[key] = value
+        return settings
+
+    def _save_translation_settings(self, settings):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.translation_settings_path.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _mask_settings_for_log(self, settings):
+        masked = json.loads(json.dumps(settings))
+        for value in masked.values():
+            if isinstance(value, dict):
+                for key in value:
+                    if key in _SENSITIVE_SETTING_KEYS and value[key]:
+                        value[key] = "***"
+        return masked
+
+    async def get_translation_settings(self):
+        return self._load_translation_settings()
+
+    async def set_translation_settings(self, settings):
+        old = self._load_translation_settings()
+        new = dict(old)
+        for key, value in (settings or {}).items():
+            if key in new:
+                new[key] = value
+        self._save_translation_settings(new)
+        decky.logger.info(f"PlayTranslate translation settings updated: {self._mask_settings_for_log(new)}")
+
+        engine_changed = old.get("engine") != new.get("engine")
+        engine_config_changed = old.get(new.get("engine")) != new.get(new.get("engine"))
+        if engine_changed or engine_config_changed:
+            await self._sync_translate_server(new)
+        # capture_dynamic.py is a separate long-running process with its
+        # translate_url/target_lang/source_lang frozen in argv at spawn time
+        # (unlike the fixed-ROI path, which re-reads settings on every
+        # translation attempt) - refresh the file it polls so a running
+        # dynamic session picks up engine/language changes without a
+        # restart. Written *after* _sync_translate_server above so
+        # _translate_url() below reflects the just-started/just-stopped
+        # local server, not a stale one.
+        if self._is_dynamic_running():
+            self._write_dynamic_translation_config(new)
+        return new
+
+    def _write_dynamic_translation_config(self, settings=None):
+        settings = settings or self._load_translation_settings()
+        config = {
+            "translate_url": self._translate_url(),
+            "target_lang": settings.get("target_lang", "Japanese"),
+            "source_lang": settings.get("source_lang", "English"),
+        }
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.dynamic_translation_config_path.write_text(
+            json.dumps(config, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
 
     def _normalize_translate_url(self, url):
         url = url.strip()
@@ -225,6 +317,9 @@ class Plugin:
             "translation_in_progress": self.translation_in_progress,
             "ocr_worker_running": self._is_ocr_worker_running(),
             "ocr_worker_pid": self.ocr_worker_process.pid if self._is_ocr_worker_running() else None,
+            "translation_engine": self._load_translation_settings().get("engine"),
+            "translate_server_running": self._is_translate_server_running(),
+            "translate_server_pid": self.translate_server_process.pid if self._is_translate_server_running() else None,
             "last_settled_mtime_ns": image_mtime_ns,
             "last_translated_image_mtime_ns": self.last_translated_image_mtime_ns,
             "translation_stale": (
@@ -627,6 +722,161 @@ class Plugin:
         if worker_py:
             await self._stop_processes_by_script(worker_py, "ocr_worker")
 
+    def _translate_server_port(self):
+        return int(os.environ.get("PLAYTRANSLATE_TRANSLATE_SERVER_PORT", "8790"))
+
+    def _translate_server_health_url(self):
+        return f"http://127.0.0.1:{self._translate_server_port()}/health"
+
+    def _is_translate_server_running(self):
+        return self.translate_server_process is not None and self.translate_server_process.poll() is None
+
+    async def _translate_server_health(self):
+        url = self._translate_server_health_url()
+
+        def check():
+            try:
+                with request.urlopen(url, timeout=2) as response:
+                    return 200 <= response.status < 300
+            except (urlerror.URLError, OSError):
+                return False
+
+        return await asyncio.to_thread(check)
+
+    def _translate_server_command(self, script, settings):
+        engine = settings.get("engine", "ollama")
+        command = [
+            "python3",
+            str(script),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self._translate_server_port()),
+            "--backend",
+            engine,
+        ]
+        if engine == "gemini":
+            cfg = settings.get("gemini") or {}
+            command += ["--model", cfg.get("model") or "gemini-3.6-flash"]
+        # No --api-key here on purpose: CLI args are visible to any other
+        # process on the box via `ps`/proc; the key is passed through the
+        # subprocess's own env instead (see _ensure_translate_server).
+        return command
+
+    def _translate_server_api_key(self, settings):
+        engine = settings.get("engine", "ollama")
+        if engine in ("gemini", "deepl", "google_cloud"):
+            return (settings.get(engine) or {}).get("api_key", "")
+        return ""
+
+    async def _ensure_translate_server(self, settings):
+        # translate_server.py is pure stdlib (no OCR/PIL deps), so unlike
+        # ocr_worker.py it runs directly - no distrobox hop needed.
+        if self._is_translate_server_running() and await self._translate_server_health():
+            return True
+
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            decky.logger.warning("PlayTranslate: engine dir not found; cannot start local translate_server.py")
+            return False
+        script = engine_dir / "translate_server.py"
+        if not script.exists():
+            decky.logger.warning(f"{script} was not found; cannot start local translate_server.py")
+            return False
+
+        await self._stop_processes_by_script(script, "translate_server")
+
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.data_dir / "translate-server.log"
+        log_file = log_path.open("a", encoding="utf-8")
+        log_file.write(
+            f"\n--- PlayTranslate translate_server start {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"engine={settings.get('engine')} ---\n"
+        )
+        log_file.flush()
+
+        command = self._translate_server_command(script, settings)
+        env = self._subprocess_env()
+        api_key = self._translate_server_api_key(settings)
+        if api_key:
+            env["PLAYTRANSLATE_ENGINE_API_KEY"] = api_key
+        # Without this, translate_server.py's own print()s (its startup
+        # banner, and every request's access-log line from log_message())
+        # sit in a fully-buffered stdout and are lost outright whenever this
+        # process gets SIGTERM'd/SIGKILL'd (the normal case - see
+        # _stop_translate_server) instead of exiting cleanly. Confirmed live:
+        # translate-server.log only ever contained the lines *this* class
+        # writes directly with an explicit flush() below, never anything
+        # translate_server.py itself printed.
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            self.translate_server_process = subprocess.Popen(
+                command,
+                cwd=str(engine_dir),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log_file.write(f"Failed to start translate_server: {exc}\n")
+            log_file.flush()
+            log_file.close()
+            return False
+
+        self.translate_server_log_file = log_file
+
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            if await self._translate_server_health():
+                decky.logger.info(f"PlayTranslate local translate_server healthy pid={self.translate_server_process.pid}")
+                return True
+            if self.translate_server_process.poll() is not None:
+                break
+
+        decky.logger.warning("PlayTranslate local translate_server did not become healthy")
+        return False
+
+    async def _ensure_translate_server_if_needed(self):
+        settings = self._load_translation_settings()
+        if settings.get("engine") == "ollama":
+            return
+        await self._ensure_translate_server(settings)
+
+    async def _sync_translate_server(self, settings):
+        await self._stop_translate_server()
+        if settings.get("engine") != "ollama":
+            await self._ensure_translate_server(settings)
+
+    async def _stop_translate_server(self):
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        script = (engine_dir / "translate_server.py") if engine_dir else None
+
+        if self.translate_server_process is not None:
+            pid = self.translate_server_process.pid
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                for _ in range(20):
+                    if self.translate_server_process.poll() is not None:
+                        break
+                    await asyncio.sleep(0.1)
+                if self.translate_server_process.poll() is None:
+                    os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.translate_server_process = None
+
+        if self.translate_server_log_file:
+            self.translate_server_log_file.write(
+                f"--- PlayTranslate translate_server stop {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+            )
+            self.translate_server_log_file.close()
+            self.translate_server_log_file = None
+
+        if script:
+            await self._stop_processes_by_script(script, "translate_server")
+
     def _write_translation_outputs(self, translation, full_result):
         self.translation_path.write_text(translation.strip() + "\n", encoding="utf-8")
         self.translation_json_path.write_text(
@@ -634,12 +884,14 @@ class Plugin:
         )
 
     def _run_translation_via_worker(self, image_path, engine_dir):
+        settings = self._load_translation_settings()
         payload = json.dumps(
             {
                 "image": str(image_path),
                 "regions_json": str(self._regions_json_path(engine_dir)),
                 "http_url": self._translate_url(),
-                "target_lang": "Japanese",
+                "target_lang": settings.get("target_lang", "Japanese"),
+                "source_lang": settings.get("source_lang", "English"),
             }
         ).encode("utf-8")
         req = request.Request(
@@ -648,8 +900,22 @@ class Plugin:
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
         )
-        with request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+        # 140s: must exceed translate_stub.py's own 130s timeout on the
+        # ocr_worker -> translate_server hop, which itself must exceed
+        # OllamaProvider's 120s timeout - otherwise this outer timeout fires
+        # first and kills a slow-but-healthy Ollama call before it can
+        # return a clean error (or a result).
+        try:
+            with request.urlopen(req, timeout=140) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            # ocr_worker.py's _handle_translate forwards translate_server.py's
+            # error/error_type as a JSON body even on a non-2xx status -
+            # surface that instead of losing it to a generic HTTPError.
+            try:
+                return json.loads(exc.read().decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise exc
 
     def _run_translation(self, engine_dir, image_path):
         # Always attempt the worker rather than gating on self.ocr_worker_process:
@@ -659,6 +925,14 @@ class Plugin:
         # call (worker absent, stale, or unhealthy) falls back below regardless.
         try:
             result = self._run_translation_via_worker(image_path, engine_dir)
+            if result.get("error"):
+                # A clean, structured failure (bad API key, rate limit, ...) -
+                # falling back to the distrobox path wouldn't fix it and
+                # would just waste ~180s retrying the same broken config, so
+                # report it directly instead of falling through below.
+                error_type = result.get("error_type")
+                message = result["error"]
+                return False, "", f"[{error_type}] {message}" if error_type else message
             translation = str(result.get("translation") or "").strip()
             if not translation:
                 return False, "", "ocr worker returned an empty translation"
@@ -774,6 +1048,15 @@ class Plugin:
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+        # Belt-and-suspenders: start_capture()/start_dynamic_capture() and
+        # set_translation_settings() already try to keep the local
+        # translate_server up, but only as a fire-and-forget task - if it
+        # died since (crash, OOM, ...) nothing else would notice before
+        # actually attempting a translation. Awaited (not fire-and-forget)
+        # here so a dead server is really back up before _run_translation
+        # tries to use it; near-instant when it's already healthy.
+        await self._ensure_translate_server_if_needed()
+
         self.translation_in_progress = True
         try:
             ok, stdout, stderr = await asyncio.to_thread(self._run_translation, engine_dir, image_path)
@@ -807,11 +1090,14 @@ class Plugin:
         if not runner.exists():
             return False, "", f"{runner} was not found"
 
+        settings = self._load_translation_settings()
         env = self._subprocess_env()
         env.setdefault("PLAYTRANSLATE_DATA_DIR", str(self.data_dir))
         env.setdefault("PLAYTRANSLATE_ENGINE_DIR", str(engine_dir))
         env.setdefault("PLAYTRANSLATE_TRANSLATE_URL", self._translate_url())
         env.setdefault("PLAYTRANSLATE_REGIONS_JSON", str(self._regions_json_path(engine_dir)))
+        env.setdefault("PLAYTRANSLATE_TARGET_LANG", settings.get("target_lang", "Japanese"))
+        env.setdefault("PLAYTRANSLATE_SOURCE_LANG", settings.get("source_lang", "English"))
 
         try:
             result = subprocess.run(
@@ -843,6 +1129,10 @@ class Plugin:
                         self._append_translation_worker_log(
                             f"translate image mtime_ns={mtime_ns} {time.strftime('%Y-%m-%d %H:%M:%S')}"
                         )
+                        # See translate_latest() for why this is awaited here
+                        # rather than relying only on the fire-and-forget
+                        # ensure calls at capture start / settings change.
+                        await self._ensure_translate_server_if_needed()
                         ok, stdout, stderr = await asyncio.to_thread(self._run_translation, engine_dir, image_path)
                         try:
                             current_mtime_ns = image_path.stat().st_mtime_ns
@@ -901,6 +1191,7 @@ class Plugin:
             if engine_dir:
                 self._start_translation_worker(engine_dir)
                 asyncio.create_task(self._ensure_ocr_worker(engine_dir))
+                asyncio.create_task(self._ensure_translate_server_if_needed())
             return await self.status()
 
         if not capture_py or not config_json:
@@ -966,6 +1257,7 @@ class Plugin:
         decky.logger.info(f"Started PlayTranslate capture pid={self.process.pid}")
         self._start_translation_worker(engine_dir)
         asyncio.create_task(self._ensure_ocr_worker(engine_dir))
+        asyncio.create_task(self._ensure_translate_server_if_needed())
         return await self.status()
 
     async def _kill_tracked_capture_process(self):
@@ -1050,6 +1342,7 @@ class Plugin:
         if self._is_dynamic_running():
             if engine_dir:
                 asyncio.create_task(self._ensure_ocr_worker(engine_dir))
+                asyncio.create_task(self._ensure_translate_server_if_needed())
             return await self.dynamic_status()
 
         if not script:
@@ -1096,6 +1389,8 @@ class Plugin:
         # rendering an overlay, then spiked in lockstep across unrelated
         # blocks the moment the real overlay was actually on screen.
 
+        translation_settings = self._load_translation_settings()
+        self._write_dynamic_translation_config(translation_settings)
         command = [
             "python3",
             str(script),
@@ -1105,6 +1400,12 @@ class Plugin:
             f"http://127.0.0.1:{self._ocr_worker_port()}",
             "--translate-url",
             self._translate_url(),
+            "--target-lang",
+            translation_settings.get("target_lang", "Japanese"),
+            "--source-lang",
+            translation_settings.get("source_lang", "English"),
+            "--translation-config",
+            str(self.dynamic_translation_config_path),
             "--output",
             str(self.active_blocks_path),
             "--pause-flag",
@@ -1137,6 +1438,7 @@ class Plugin:
 
         decky.logger.info(f"Started PlayTranslate dynamic capture pid={self.dynamic_process.pid}")
         asyncio.create_task(self._ensure_ocr_worker(engine_dir))
+        asyncio.create_task(self._ensure_translate_server_if_needed())
         return await self.dynamic_status()
 
     async def stop_dynamic_capture(self):
