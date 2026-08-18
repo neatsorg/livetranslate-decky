@@ -994,8 +994,12 @@ def main():
     parser.add_argument(
         "--startup-delay",
         type=float,
-        default=6.0,
-        help="Seconds to wait before the first discovery attempt, so the QAM sidebar (always open when this process is started) can be closed first.",
+        default=0.0,
+        help="Seconds to wait before the first discovery attempt, so the QAM sidebar (always open when this process is started) can be closed first. "
+        "Was 6.0 by default - live latency measurement showed this alone accounted for ~79%% of the time between pressing Start/Refresh and a translation "
+        "actually appearing, while index.tsx's CloseSideMenus() call (the primary defense against capturing the QAM's own text) was confirmed working in "
+        "every measured session. Cut to 0.0 for now as a deliberate tradeoff, not a settled fix - see PHASE_A_HANDOFF.md's 2026-08-19 section for the "
+        "measurements and the residual risk if CloseSideMenus() ever silently stops working.",
     )
     parser.add_argument("--translate-url", default="http://192.168.1.32:8787/translate", help="Translation HTTP endpoint.")
     parser.add_argument("--target-lang", default="Japanese")
