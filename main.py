@@ -2,6 +2,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import math
 import os
 import re
 import select
@@ -67,6 +68,8 @@ _DEFAULT_KEYBINDING_SETTINGS = {
         {"id": "default_touch_translate", "command": "touch_translate", "keys": ["L4", "L2"], "long_press": False, "threshold_ms": 900},
     ]
 }
+_MIN_KEYBINDING_THRESHOLD_MS = 300
+_MAX_KEYBINDING_THRESHOLD_MS = 3000
 
 
 class Plugin:
@@ -371,9 +374,21 @@ class Plugin:
             return False
         if not isinstance(binding.get("long_press"), bool):
             return False
-        if not isinstance(binding.get("threshold_ms"), (int, float)):
+        threshold_ms = binding.get("threshold_ms")
+        if isinstance(threshold_ms, bool) or not isinstance(threshold_ms, (int, float)):
+            return False
+        if not math.isfinite(threshold_ms):
             return False
         return True
+
+    def _normalize_binding(self, binding):
+        normalized = dict(binding)
+        threshold_ms = int(round(float(normalized.get("threshold_ms", 900))))
+        normalized["threshold_ms"] = max(
+            _MIN_KEYBINDING_THRESHOLD_MS,
+            min(_MAX_KEYBINDING_THRESHOLD_MS, threshold_ms),
+        )
+        return normalized
 
     def _binding_signature(self, binding):
         return (frozenset(binding["keys"]), bool(binding["long_press"]))
@@ -397,6 +412,7 @@ class Plugin:
         bindings = data.get("bindings") if isinstance(data, dict) else None
         if not isinstance(bindings, list) or not all(self._is_valid_binding(b) for b in bindings):
             return json.loads(json.dumps(_DEFAULT_KEYBINDING_SETTINGS))
+        bindings = [self._normalize_binding(b) for b in bindings]
         if self._has_duplicate_binding_signature(bindings):
             return json.loads(json.dumps(_DEFAULT_KEYBINDING_SETTINGS))
         return {"bindings": bindings}
@@ -414,6 +430,7 @@ class Plugin:
         bindings = (settings or {}).get("bindings", [])
         if not isinstance(bindings, list) or not all(self._is_valid_binding(b) for b in bindings):
             return {"ok": False, "error": "invalid binding shape", **self._load_keybinding_settings()}
+        bindings = [self._normalize_binding(b) for b in bindings]
         if self._has_duplicate_binding_signature(bindings):
             return {"ok": False, "error": "duplicate binding (same keys + same long-press setting) across commands"}
         new = {"bindings": bindings}

@@ -195,7 +195,7 @@ def _proto_to_blocks(proto_bytes, scale_x, scale_y, min_confidence):
         text = (line.utf8_string or "").strip()
         if not text:
             continue
-        if line.confidence and line.confidence < min_confidence:
+        if line.confidence < min_confidence:
             continue
 
         bb = line.bounding_box
