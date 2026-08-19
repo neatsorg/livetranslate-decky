@@ -13,6 +13,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { FaLanguage } from "react-icons/fa";
 import { CompositionRequest, UIComposition } from "./Composition";
 import { openRegionCalibration } from "./Calibration";
+import { openKeybindings } from "./Keybindings";
 
 type CaptureStatus = {
   running: boolean;
@@ -174,6 +175,20 @@ const setDynamicStatusToastVisible = callable<[boolean], { status_toast_visible:
 const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
 const requestTapTranslate = callable<[number, number], TapResult>("request_tap_translate");
 
+type BindingCommand = "refresh" | "pause_resume" | "touch_translate";
+
+type Binding = {
+  id: string;
+  command: BindingCommand;
+  keys: string[];
+  long_press: boolean;
+  threshold_ms: number;
+};
+
+type KeybindingSettings = { bindings: Binding[] };
+
+const getKeybindingSettings = callable<[], KeybindingSettings>("get_keybinding_settings");
+
 /**
  * Close the QAM sidebar right after starting the dynamic engine, so its own
  * first discovery pass doesn't bake the sidebar's own text into the block
@@ -220,16 +235,51 @@ const tryCloseQuickAccessMenu = () => {
  * HUD showing frozen multi-block data. */
 const ACTIVE_BLOCKS_FRESHNESS_S = 15;
 
-// How long L4 must be held before release counts as a "long press" in
-// Dynamic mode (toggle pause) rather than a short tap (refresh). Comfortably
-// above the 150ms poll interval and the legacy hold-to-show threshold below,
-// so a normal tap can't accidentally register as a long press.
-const DYNAMIC_LONG_PRESS_MS = 900;
-
 // StatusToast's own default visible duration (see its durationMs ?? 2000
 // below) plus a margin, for how long showToast() below should suppress
 // Dynamic Capture so the toast itself never gets OCR'd as game text.
 const STATUS_TOAST_SUPPRESS_MS = 2500;
+
+// A key-set signature groups bindings that share the same combo regardless
+// of order - e.g. ["L4","L2"] and ["L2","L4"] are the same group. The
+// backend's duplicate-signature rule (main.py's _binding_signature) means
+// at most one non-long-press ("tap") and one long-press ("hold") binding
+// can ever share a signature, generalizing today's L4-dual-role (short tap
+// = refresh, long hold = pause/resume) to any key-set/command pair.
+function keySetSignature(keys: string[]): string {
+  return [...keys].sort().join("+");
+}
+
+type KeySetGroup = {
+  keys: string[];
+  tapBinding: Binding | null;
+  holdBinding: Binding | null;
+};
+
+type GroupRuntimeState = {
+  holdStart: number | null;
+  longPressFired: boolean;
+  wasHeld: boolean;
+};
+
+function buildKeySetGroups(bindings: Binding[]): KeySetGroup[] {
+  const groups = new Map<string, KeySetGroup>();
+  for (const binding of bindings) {
+    if (binding.command === "touch_translate") continue;
+    const signature = keySetSignature(binding.keys);
+    let group = groups.get(signature);
+    if (!group) {
+      group = { keys: [...binding.keys], tapBinding: null, holdBinding: null };
+      groups.set(signature, group);
+    }
+    if (binding.long_press) {
+      group.holdBinding = binding;
+    } else {
+      group.tapBinding = binding;
+    }
+  }
+  return Array.from(groups.values());
+}
 
 function startHotkeyPolling() {
   let hotkeyBusy = false;
@@ -242,16 +292,12 @@ function startHotkeyPolling() {
   // Whether the dynamic engine process is currently running (regardless of
   // paused/producing-fresh-blocks) - see PositionedOverlay's dynamic_status
   // poll, the one place this is tracked continuously (Content's own copy
-  // only updates while the QAM panel is open). While true, L4 completely
-  // changes role: short tap = refresh, long hold = pause/resume, instead of
-  // the legacy hold-to-show/press-to-hide SubtitleHud gestures below. Once
-  // Dynamic mode is the only mode, the legacy branch goes away entirely.
+  // only updates while the QAM panel is open). While true, input is driven
+  // entirely by the user's configured keybindings (see keySetGroups below)
+  // instead of the legacy hold-to-show/press-to-hide SubtitleHud gestures
+  // below. Once Dynamic mode is the only mode, the legacy branch goes away
+  // entirely.
   let dynamicRunning = false;
-  // Guards the Dynamic-mode long-press from firing more than once per hold
-  // (it fires mid-hold now, not on release - see the dynamicRunning branch
-  // below) and tells release-handling not to also treat the same press as
-  // a short-tap refresh.
-  let dynamicLongPressFired = false;
   // Whether the dynamic engine is currently paused (see toggle_dynamic_
   // pause() in main.py) - sourced from the same continuous dynamic_status
   // poll as dynamicRunning (PositionedOverlay's effect, below). Tap-to-
@@ -308,18 +354,84 @@ function startHotkeyPolling() {
     }, STATUS_TOAST_SUPPRESS_MS);
   };
 
+  // User-configured keybindings (see Keybindings.tsx), fetched once here
+  // and re-fetched whenever the config screen saves - fetched into closure
+  // vars rather than React state, matching every other piece of state in
+  // this polling loop. keySetGroups/touchTranslateBindings are derived from
+  // bindings; groupState tracks per-key-set hold/tap timing, keyed by the
+  // same signature used to build the groups.
+  let bindings: Binding[] = [];
+  let keySetGroups: KeySetGroup[] = [];
+  let touchTranslateBindings: Binding[] = [];
+  const groupState = new Map<string, GroupRuntimeState>();
+
+  const applyBindings = (newBindings: Binding[]) => {
+    bindings = newBindings;
+    keySetGroups = buildKeySetGroups(bindings);
+    touchTranslateBindings = bindings.filter((b) => b.command === "touch_translate");
+    groupState.clear();
+    for (const group of keySetGroups) {
+      groupState.set(keySetSignature(group.keys), { holdStart: null, longPressFired: false, wasHeld: false });
+    }
+  };
+
+  const loadBindings = () => {
+    getKeybindingSettings()
+      .then((settings) => applyBindings(settings.bindings))
+      .catch(() => {});
+  };
+  loadBindings();
+  const handleKeybindingsChanged = () => loadBindings();
+  window.addEventListener("playtranslate-keybindings-changed", handleKeybindingsChanged);
+
+  // command dispatch shared by every key-set group below - "refresh" and
+  // "pause_resume" are the only two commands a non-touch_translate group
+  // can hold. whileHeld distinguishes a long-press fire (still holding,
+  // matches the original "(release now)" toast wording) from a tap fire
+  // (already released, that wording wouldn't make sense).
+  const fireBinding = async (binding: Binding, whileHeld: boolean) => {
+    hotkeyBusy = true;
+    try {
+      if (binding.command === "refresh") {
+        const refreshed = await refreshDynamicCapture();
+        if (refreshed.error) {
+          console.warn(`refresh dynamic capture: ${refreshed.error}`);
+        } else {
+          showToast("PlayTranslate: refreshed");
+        }
+      } else if (binding.command === "pause_resume") {
+        const toggled = await toggleDynamicPause();
+        if (toggled.error) {
+          console.warn(`toggle dynamic pause: ${toggled.error}`);
+        } else {
+          const suffix = whileHeld ? " (release now)" : "";
+          showToast(toggled.paused ? `PlayTranslate: paused${suffix}` : `PlayTranslate: resumed${suffix}`);
+        }
+      }
+    } finally {
+      hotkeyBusy = false;
+    }
+  };
+
   const handleHudVisible = () => {
     hudVisible = true;
   };
   const handleHudHidden = () => {
     hudVisible = false;
   };
+  const resetGroupStates = () => {
+    for (const state of groupState.values()) {
+      state.holdStart = null;
+      state.longPressFired = false;
+      state.wasHeld = false;
+    }
+  };
   const handleDynamicRunningChanged = (event: Event) => {
     const detail = (event as CustomEvent<{ running?: boolean; paused?: boolean }>).detail;
     dynamicRunning = !!detail?.running;
     dynamicPaused = !!detail?.paused;
     holdStart = null;
-    dynamicLongPressFired = false;
+    resetGroupStates();
     setTapModeActive(false);
   };
   window.addEventListener("playtranslate-hud-visible", handleHudVisible);
@@ -336,7 +448,7 @@ function startHotkeyPolling() {
       const result = await testHidrawButtonState();
       if (!result.success) {
         holdStart = null;
-        dynamicLongPressFired = false;
+        resetGroupStates();
         showTriggeredForPress = false;
         l4WasPressed = false;
         l5WasPressed = false;
@@ -356,66 +468,70 @@ function startHotkeyPolling() {
       const l4Pressed = result.buttons.includes("L4");
 
       if (dynamicRunning) {
-        // Tap-to-translate: holding L4+L2 together while paused hands the
+        const heldSet = new Set(result.buttons);
+        const now = Date.now();
+
+        // Tap-to-translate: any touch_translate binding whose key-set is a
+        // subset of what's currently held, while paused, hands the
         // touchscreen to TapTranslateOverlay (a long-press-tap there looks
         // up whatever block capture_dynamic.py has boxed at that point).
-        // Checked first, ahead of L4's own tap/hold handling below, so
-        // holding L2 alongside L4 fully overrides refresh/pause for as
-        // long as the combo is held - releasing either button falls
-        // straight back to normal L4 behavior with no in-progress
-        // tap/hold state left over (see the resets below).
-        const l2Pressed = result.buttons.includes("L2");
-        if (l4Pressed && l2Pressed && dynamicPaused) {
+        // Checked first, ahead of the other bindings below, so holding the
+        // combo fully overrides refresh/pause for as long as it's held -
+        // releasing any of its keys falls straight back to normal
+        // tap/hold-group behavior with no in-progress state left over (the
+        // per-group reset below, generalized from the original L4+L2-only
+        // version's holdStart/dynamicLongPressFired/l4WasPressed reset).
+        const touchMatch =
+          dynamicPaused && touchTranslateBindings.some((b) => b.keys.every((k) => heldSet.has(k)));
+        if (touchMatch) {
           setTapModeActive(true);
-          holdStart = null;
-          dynamicLongPressFired = false;
-          l4WasPressed = l4Pressed;
+          for (const group of keySetGroups) {
+            const state = groupState.get(keySetSignature(group.keys));
+            if (!state) continue;
+            state.holdStart = null;
+            state.longPressFired = false;
+            state.wasHeld = group.keys.every((k) => heldSet.has(k));
+          }
           return;
         }
         setTapModeActive(false);
 
-        // Long-press fires the instant the hold crosses
-        // DYNAMIC_LONG_PRESS_MS - *while still held*, not on release - so
-        // the toast appears as immediate feedback the user can watch for,
-        // telling them it's safe to let go rather than having to guess how
-        // long is long enough. A short tap (released before the threshold)
-        // fires refresh on release instead.
-        if (l4Pressed && !l4WasPressed) {
-          holdStart = Date.now();
-          dynamicLongPressFired = false;
-        } else if (l4Pressed && l4WasPressed && holdStart !== null && !dynamicLongPressFired) {
-          if (Date.now() - holdStart >= DYNAMIC_LONG_PRESS_MS) {
-            dynamicLongPressFired = true;
-            hotkeyBusy = true;
-            try {
-              const toggled = await toggleDynamicPause();
-              if (toggled.error) {
-                console.warn(`toggle dynamic pause: ${toggled.error}`);
-              } else {
-                showToast(toggled.paused ? "PlayTranslate: paused (release now)" : "PlayTranslate: resumed (release now)");
-              }
-            } finally {
-              hotkeyBusy = false;
+        for (const group of keySetGroups) {
+          const state = groupState.get(keySetSignature(group.keys));
+          if (!state) continue;
+          const isHeld = group.keys.every((k) => heldSet.has(k));
+
+          if (isHeld && !state.wasHeld) {
+            state.holdStart = now;
+            state.longPressFired = false;
+          } else if (
+            isHeld &&
+            state.wasHeld &&
+            state.holdStart !== null &&
+            !state.longPressFired &&
+            group.holdBinding
+          ) {
+            // Long-press fires the instant the hold crosses the binding's
+            // threshold - *while still held*, not on release - so the
+            // toast appears as immediate feedback the user can watch for,
+            // telling them it's safe to let go rather than having to guess
+            // how long is long enough.
+            if (now - state.holdStart >= group.holdBinding.threshold_ms) {
+              state.longPressFired = true;
+              await fireBinding(group.holdBinding, true);
             }
-          }
-        } else if (!l4Pressed && l4WasPressed) {
-          if (holdStart !== null && !dynamicLongPressFired) {
-            hotkeyBusy = true;
-            try {
-              const refreshed = await refreshDynamicCapture();
-              if (refreshed.error) {
-                console.warn(`refresh dynamic capture: ${refreshed.error}`);
-              } else {
-                showToast("PlayTranslate: refreshed");
-              }
-            } finally {
-              hotkeyBusy = false;
+          } else if (!isHeld && state.wasHeld) {
+            // A short tap (released before the threshold, or a key-set
+            // with no hold variant configured at all) fires its tap
+            // binding on release.
+            if (state.holdStart !== null && !state.longPressFired && group.tapBinding) {
+              await fireBinding(group.tapBinding, false);
             }
+            state.holdStart = null;
+            state.longPressFired = false;
           }
-          holdStart = null;
-          dynamicLongPressFired = false;
+          state.wasHeld = isHeld;
         }
-        l4WasPressed = l4Pressed;
         return;
       }
 
@@ -479,7 +595,7 @@ function startHotkeyPolling() {
       }
     } catch {
       holdStart = null;
-      dynamicLongPressFired = false;
+      resetGroupStates();
       showTriggeredForPress = false;
       l5WasPressed = false;
       setTapModeActive(false);
@@ -493,6 +609,7 @@ function startHotkeyPolling() {
     window.removeEventListener("playtranslate-hud-visible", handleHudVisible);
     window.removeEventListener("playtranslate-hud-hidden", handleHudHidden);
     window.removeEventListener("playtranslate-dynamic-running-changed", handleDynamicRunningChanged);
+    window.removeEventListener("playtranslate-keybindings-changed", handleKeybindingsChanged);
   };
 }
 
@@ -724,9 +841,9 @@ function StatusToast() {
 }
 
 // Long-press threshold for a touchscreen tap to count as "translate this
-// point" while TapTranslateOverlay is active - independent of
-// DYNAMIC_LONG_PRESS_MS above (that one's a button hold, this is a touch
-// gesture), comfortably above an accidental brush of the screen.
+// point" while TapTranslateOverlay is active - independent of any
+// keybinding's own long-press threshold (that's a button hold, this is a
+// touch gesture), comfortably above an accidental brush of the screen.
 const TAP_LONG_PRESS_MS = 450;
 // Above this many screen pixels of movement, a held touch is treated as a
 // drag/swipe and the pending tap-translate is cancelled - same tap-vs-drag
@@ -1343,6 +1460,11 @@ function Content() {
       <PanelSectionRow>
         <ButtonItem disabled={busy} layout="below" onClick={() => openRegionCalibration()}>
           Calibrate Regions
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem disabled={busy} layout="below" onClick={() => openKeybindings()}>
+          Configure Keybindings
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>

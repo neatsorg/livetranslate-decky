@@ -45,6 +45,29 @@ _DEFAULT_OCR_SETTINGS = {
     "chromescreenai": {"min_confidence": 0.5},
 }
 
+# The 18 bindable keys for the keybinding feature (no d-pad - see
+# keybinding UI design discussion). Dynamic Capture Start/Stop is
+# deliberately never bindable, UI-button only.
+_VALID_KEYS = {
+    "A", "B", "X", "Y",
+    "L1", "L2", "L3", "L4", "L5",
+    "R1", "R2", "R3", "R4", "R5",
+    "select", "start",
+    "trackpad_left_tap", "trackpad_right_tap",
+}
+_VALID_COMMANDS = {"refresh", "pause_resume", "touch_translate"}
+
+# Reproduces today's hardcoded index.tsx behavior exactly: L4 alone (no
+# long-press) refreshes, L4 alone held past 900ms pauses/resumes, L4+L2
+# held (while paused) enters tap-translate mode.
+_DEFAULT_KEYBINDING_SETTINGS = {
+    "bindings": [
+        {"id": "default_refresh", "command": "refresh", "keys": ["L4"], "long_press": False, "threshold_ms": 900},
+        {"id": "default_pause_resume", "command": "pause_resume", "keys": ["L4"], "long_press": True, "threshold_ms": 900},
+        {"id": "default_touch_translate", "command": "touch_translate", "keys": ["L4", "L2"], "long_press": False, "threshold_ms": 900},
+    ]
+}
+
 
 class Plugin:
     def __init__(self):
@@ -81,6 +104,7 @@ class Plugin:
         self.tap_request_path = self.data_dir / "tap_request.json"
         self.tap_result_path = self.data_dir / "tap_result.json"
         self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
+        self.keybinding_settings_path = self.data_dir / "keybindings.json"
         self.hidraw_path = None
 
     async def _main(self):
@@ -334,6 +358,68 @@ class Plugin:
             if engine_dir is not None:
                 await self._ensure_ocr_worker(engine_dir)
         return new
+
+    def _is_valid_binding(self, binding):
+        if not isinstance(binding, dict):
+            return False
+        if binding.get("command") not in _VALID_COMMANDS:
+            return False
+        keys = binding.get("keys")
+        if not isinstance(keys, list) or not (1 <= len(keys) <= 3):
+            return False
+        if len(set(keys)) != len(keys) or any(key not in _VALID_KEYS for key in keys):
+            return False
+        if not isinstance(binding.get("long_press"), bool):
+            return False
+        if not isinstance(binding.get("threshold_ms"), (int, float)):
+            return False
+        return True
+
+    def _binding_signature(self, binding):
+        return (frozenset(binding["keys"]), bool(binding["long_press"]))
+
+    def _has_duplicate_binding_signature(self, bindings):
+        seen = set()
+        for binding in bindings:
+            signature = self._binding_signature(binding)
+            if signature in seen:
+                return True
+            seen.add(signature)
+        return False
+
+    def _load_keybinding_settings(self):
+        if not self.keybinding_settings_path.exists():
+            return json.loads(json.dumps(_DEFAULT_KEYBINDING_SETTINGS))
+        try:
+            data = json.loads(self.keybinding_settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return json.loads(json.dumps(_DEFAULT_KEYBINDING_SETTINGS))
+        bindings = data.get("bindings") if isinstance(data, dict) else None
+        if not isinstance(bindings, list) or not all(self._is_valid_binding(b) for b in bindings):
+            return json.loads(json.dumps(_DEFAULT_KEYBINDING_SETTINGS))
+        if self._has_duplicate_binding_signature(bindings):
+            return json.loads(json.dumps(_DEFAULT_KEYBINDING_SETTINGS))
+        return {"bindings": bindings}
+
+    def _save_keybinding_settings(self, settings):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.keybinding_settings_path.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    async def get_keybinding_settings(self):
+        return self._load_keybinding_settings()
+
+    async def set_keybinding_settings(self, settings):
+        bindings = (settings or {}).get("bindings", [])
+        if not isinstance(bindings, list) or not all(self._is_valid_binding(b) for b in bindings):
+            return {"ok": False, "error": "invalid binding shape", **self._load_keybinding_settings()}
+        if self._has_duplicate_binding_signature(bindings):
+            return {"ok": False, "error": "duplicate binding (same keys + same long-press setting) across commands"}
+        new = {"bindings": bindings}
+        self._save_keybinding_settings(new)
+        decky.logger.info(f"PlayTranslate keybindings updated: {new}")
+        return {"ok": True, **new}
 
     def _get_screenai_downloader(self):
         """Lazily loads screenai_downloader.py from the engine dir (same
@@ -1130,27 +1216,53 @@ class Plugin:
         self.hidraw_path = candidates[-1][1] if candidates else None
         return self.hidraw_path
 
+    # Every entry: button name, byte offset into the 64-byte report, and the
+    # mask to test against that single byte. None of these came from a
+    # public spec - all measured live on hardware by capturing raw hidraw
+    # reports on /dev/hidraw2 (of the 3 candidate interfaces at VID:PID
+    # 28DE:1205, the other two - :1.0 and :1.1 - never produced a single
+    # report in any measurement session, idle or active) while holding each
+    # button and diffing against an idle baseline. L2/L4/L5/R4/R5 were
+    # measured first (see the original comment this table replaced); the
+    # remaining 13 keys (A/B/X/Y/L1/L3/R1/R2/R3/select/start + both
+    # trackpad taps) were measured 2026-08-19 the same way, one key at a
+    # time to avoid overlapping presses contaminating the diff (batched
+    # multi-key passes produced ambiguous/colliding results for the
+    # closely-timed L3/R3/select/start group - isolate each key if
+    # re-measuring). R2's bit correlates with its analog trigger axis
+    # moving (a separate field elsewhere in the report), same as L2.
+    # Trackpad taps are level signals (high the entire time a finger is on
+    # the pad) living in this same buttons_l/buttons_h bitfield, not a
+    # separate coordinate-only field - no distinct interface or report
+    # needed for them beyond what L2/L4/L5/R4/R5 already used.
+    _BUTTON_FIELDS = [
+        {"name": "A", "offset": 8, "mask": 0x80},
+        {"name": "B", "offset": 8, "mask": 0x20},
+        {"name": "X", "offset": 8, "mask": 0x40},
+        {"name": "Y", "offset": 8, "mask": 0x10},
+        {"name": "L1", "offset": 8, "mask": 0x08},
+        {"name": "R1", "offset": 8, "mask": 0x04},
+        # R2's digital soft-pull click, not its analog trigger axis.
+        {"name": "R2", "offset": 8, "mask": 0x01},
+        # L2's digital soft-pull click, not its analog trigger axis (that's
+        # a separate 16-bit value elsewhere in the report).
+        {"name": "L2", "offset": 8, "mask": 0x02},
+        {"name": "L5", "offset": 9, "mask": 0x80},
+        {"name": "select", "offset": 9, "mask": 0x10},
+        {"name": "start", "offset": 9, "mask": 0x40},
+        {"name": "R5", "offset": 10, "mask": 0x01},
+        {"name": "trackpad_left_tap", "offset": 10, "mask": 0x08},
+        {"name": "trackpad_right_tap", "offset": 10, "mask": 0x10},
+        {"name": "L3", "offset": 10, "mask": 0x40},
+        {"name": "R3", "offset": 11, "mask": 0x04},
+        {"name": "L4", "offset": 13, "mask": 0x02},
+        {"name": "R4", "offset": 13, "mask": 0x04},
+    ]
+
     def _read_hidraw_buttons_once(self, timeout=0.2):
         path = self._find_steamdeck_hidraw()
         if not path:
             return {"success": False, "buttons": [], "error": "Steam Deck hidraw device was not found"}
-
-        buttons_l_masks = {
-            "L5": 0x00008000,
-            "R5": 0x00010000,
-            # L2's digital soft-pull click, not its analog trigger axis
-            # (that's a separate 16-bit value elsewhere in the report).
-            # Measured live on hardware (not previously documented anywhere
-            # in this repo) by capturing raw hidraw reports while holding
-            # each button and diffing against an idle baseline - confirmed
-            # to fire repeatedly and only while L2 was held, correlated with
-            # the analog trigger axis moving in the same windows.
-            "L2": 0x00000002,
-        }
-        buttons_h_masks = {
-            "L4": 0x00000200,
-            "R4": 0x00000400,
-        }
 
         fd = None
         try:
@@ -1164,15 +1276,11 @@ class Plugin:
                 data = os.read(fd, 64)
                 if len(data) < 16:
                     continue
-                buttons_l = struct.unpack("<I", data[8:12])[0]
-                buttons_h = struct.unpack("<I", data[12:16])[0]
-                buttons = []
-                for name, mask in buttons_l_masks.items():
-                    if buttons_l & mask:
-                        buttons.append(name)
-                for name, mask in buttons_h_masks.items():
-                    if buttons_h & mask:
-                        buttons.append(name)
+                buttons = [
+                    field["name"]
+                    for field in self._BUTTON_FIELDS
+                    if data[field["offset"]] & field["mask"]
+                ]
                 last_buttons = buttons
                 if buttons:
                     break
