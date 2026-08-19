@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -369,8 +370,157 @@ class DiscoveryEngine:
             return blocks
 
 
+class ChromeScreenAIEngine:
+    """Full-frame discovery backed by libchromescreenai.so (see
+    ocr_screenai.py), run as a persistent subprocess talked to over a
+    JSON-line stdin/stdout protocol - same idea as TesserocrEngine staying
+    resident to avoid paying model-load cost per call, but kept in a
+    separate process so a native-library crash or an incompatible .so
+    build can't take the resident ocr_worker.py HTTP server down with it.
+
+    Chrome Screen AI groups detected lines into blocks/paragraphs itself
+    (see proto/chrome_screen_ai.proto's LineBox.block_id), so results come
+    back already block-shaped - group_lines_into_blocks() above exists
+    only to compensate for Tesseract's SPARSE_TEXT mode returning flat,
+    ungrouped lines, and isn't used on this path.
+    """
+
+    name = "chromescreenai"
+
+    def __init__(self, script_path, python_path, model_dir, min_confidence=0.5):
+        self._script = str(script_path)
+        self._python = python_path
+        self._model_dir = model_dir
+        self._min_confidence = min_confidence
+        self._lock = threading.Lock()
+        self._proc = None
+        self.init_error = None
+
+    def is_available(self):
+        return bool(self._model_dir) and os.path.exists(
+            os.path.join(self._model_dir, "libchromescreenai.so")
+        )
+
+    def _alive(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def _drain_stderr(self, proc):
+        def drain():
+            try:
+                for raw in iter(proc.stderr.readline, b""):
+                    if not raw:
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=drain, daemon=True).start()
+
+    def _start_locked(self):
+        if self._alive():
+            return True
+        if not self.is_available():
+            self.init_error = "Chrome Screen AI model files not downloaded"
+            return False
+        try:
+            self._proc = subprocess.Popen(
+                [self._python, self._script, "--worker"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            self.init_error = f"failed to spawn ocr_screenai.py: {exc}"
+            self._proc = None
+            return False
+
+        self._drain_stderr(self._proc)
+        init_msg = {"type": "init", "model_dir": self._model_dir, "min_confidence": self._min_confidence}
+        try:
+            self._proc.stdin.write((json.dumps(init_msg) + "\n").encode())
+            self._proc.stdin.flush()
+            line = self._proc.stdout.readline()
+            if not line:
+                self.init_error = "worker died before ready response"
+                self._kill_locked()
+                return False
+            ready = json.loads(line.decode().strip())
+            if ready.get("error"):
+                self.init_error = ready["error"]
+                self._kill_locked()
+                return False
+        except Exception as exc:
+            self.init_error = str(exc)
+            self._kill_locked()
+            return False
+
+        self.init_error = None
+        return True
+
+    def _kill_locked(self):
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.stdin.write(b'{"type":"shutdown"}\n')
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def stop(self):
+        with self._lock:
+            self._kill_locked()
+
+    def discover(self, image_path, conf_threshold=70.0):
+        # conf_threshold arrives on ocr_worker.py's existing 0-100 Tesseract
+        # scale (capture_dynamic.py's --conf-threshold / --conf-threshold-
+        # retry); ocr_screenai.py's confidence is 0-1, so rescale per call
+        # rather than baking a threshold into the worker at init time - the
+        # dynamic capture loop retries discovery at a lower threshold when
+        # the first pass finds nothing, and that retry has to actually
+        # reach the engine each time, not just be silently ignored.
+        min_confidence = max(0.0, min(1.0, conf_threshold / 100.0))
+        request = {
+            "type": "recognize",
+            "image_path": str(image_path),
+            "min_confidence": min_confidence,
+        }
+        with self._lock:
+            if not self._alive() and not self._start_locked():
+                raise RuntimeError(self.init_error or "Chrome Screen AI worker unavailable")
+            try:
+                self._proc.stdin.write((json.dumps(request) + "\n").encode())
+                self._proc.stdin.flush()
+                line = self._proc.stdout.readline()
+            except Exception as exc:
+                self._kill_locked()
+                raise RuntimeError(f"Chrome Screen AI worker I/O error: {exc}") from exc
+            if not line:
+                self._kill_locked()
+                raise RuntimeError("Chrome Screen AI worker died mid-request")
+            response = json.loads(line.decode().strip())
+
+        if response.get("error"):
+            raise RuntimeError(response["error"])
+        return response.get("blocks", [])
+
+
 class Worker:
-    def __init__(self, ocr_script, translate_script):
+    def __init__(
+        self,
+        ocr_script,
+        translate_script,
+        ocr_engine="tesseract",
+        screenai_script=None,
+        screenai_model_dir=None,
+        screenai_min_confidence=0.5,
+    ):
         self.ocr = load_module(ocr_script, "playtranslate_worker_ocr")
         self.translate = load_module(translate_script, "playtranslate_worker_translate")
 
@@ -390,6 +540,13 @@ class Worker:
                 print(f"tesserocr installed but no tessdata dir found; using CLI fallback", file=sys.stderr, flush=True)
             self.engine = CliEngine(self.ocr, self.tesseract_path)
             self.discovery_engine = None
+
+        self.ocr_engine_name = ocr_engine
+        self.screenai_engine = None
+        if screenai_script is not None:
+            self.screenai_engine = ChromeScreenAIEngine(
+                screenai_script, sys.executable, screenai_model_dir, screenai_min_confidence
+            )
 
         self.started_at = time.monotonic()
         self._regions_cache = {}  # path str -> (mtime_ns, regions)
@@ -459,14 +616,27 @@ class Worker:
             cropped.save(output_path)
 
     def discover_blocks(self, image_path, lang="eng", conf_threshold=70.0, upscale_pct=130, autocontrast=True):
-        if self.discovery_engine is None:
-            raise RuntimeError("discovery requires tesserocr + tessdata (CLI fallback not supported)")
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(str(image_path))
         t0 = time.monotonic()
+        engine_used = self.ocr_engine_name
+
+        if self.ocr_engine_name == "chromescreenai" and self.screenai_engine is not None:
+            try:
+                blocks = self.screenai_engine.discover(image_path, conf_threshold=conf_threshold)
+                return {"blocks": blocks, "elapsed_s": round(time.monotonic() - t0, 3), "engine": "chromescreenai"}
+            except Exception as exc:
+                # Self-heal rather than error out the whole discovery pass:
+                # fall back to Tesseract for this call (e.g. model files
+                # deleted mid-session, worker crashed and won't restart).
+                print(f"chromescreenai discovery failed, falling back to tesseract: {exc}", file=sys.stderr, flush=True)
+                engine_used = "tesseract"
+
+        if self.discovery_engine is None:
+            raise RuntimeError("discovery requires tesserocr + tessdata (CLI fallback not supported)")
         blocks = self.discovery_engine.discover(image_path, lang, conf_threshold, upscale_pct, autocontrast)
-        return {"blocks": blocks, "elapsed_s": round(time.monotonic() - t0, 3)}
+        return {"blocks": blocks, "elapsed_s": round(time.monotonic() - t0, 3), "engine": engine_used}
 
     def translate_image(self, image_path, regions_json, http_url, target_lang, source_lang="English"):
         t_start = time.monotonic()
@@ -550,6 +720,13 @@ class Handler(BaseHTTPRequestHandler):
                     "engine": worker.engine_name,
                     "tesseract": worker.tesseract_path,
                     "uptime_s": round(time.monotonic() - worker.started_at, 1),
+                    "discovery_engine": worker.ocr_engine_name,
+                    "chromescreenai_available": (
+                        worker.screenai_engine.is_available() if worker.screenai_engine else False
+                    ),
+                    "chromescreenai_error": (
+                        worker.screenai_engine.init_error if worker.screenai_engine else None
+                    ),
                 },
             )
             return
@@ -653,9 +830,24 @@ def main():
     parser.add_argument("--port", type=int, default=8788, help="Bind port.")
     parser.add_argument("--ocr-script", type=Path, default=Path(__file__).with_name("ocr_tesseract.py"))
     parser.add_argument("--translate-script", type=Path, default=Path(__file__).with_name("translate_stub.py"))
+    parser.add_argument(
+        "--ocr-engine", choices=["tesseract", "chromescreenai"], default="chromescreenai",
+        help="Full-frame discovery engine (/discover_blocks). Falls back to tesseract if chromescreenai is unavailable "
+             "(also selectable directly - kept around as a debug fallback).",
+    )
+    parser.add_argument("--screenai-script", type=Path, default=Path(__file__).with_name("ocr_screenai.py"))
+    parser.add_argument("--screenai-model-dir", default=None, help="Dir containing libchromescreenai.so + models.")
+    parser.add_argument("--screenai-min-confidence", type=float, default=0.5)
     args = parser.parse_args()
 
-    worker = Worker(args.ocr_script, args.translate_script)
+    worker = Worker(
+        args.ocr_script,
+        args.translate_script,
+        ocr_engine=args.ocr_engine,
+        screenai_script=args.screenai_script,
+        screenai_model_dir=args.screenai_model_dir,
+        screenai_min_confidence=args.screenai_min_confidence,
+    )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.worker = worker
     print(

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import importlib.util
 import json
 import os
 import re
@@ -32,6 +33,18 @@ _DEFAULT_TRANSLATION_SETTINGS = {
 }
 _SENSITIVE_SETTING_KEYS = {"api_key"}
 
+_DEFAULT_OCR_SETTINGS = {
+    # "chromescreenai" (default - on-device neural OCR, downloaded on demand,
+    # see screenai_downloader.py) or "tesseract" (kept around as a debug
+    # fallback; Tesseract also needs setup work on a fresh Steam Deck, so it
+    # has no real zero-install advantage over chromescreenai as a default -
+    # see project_playtranslate_multi_engine_design). Only affects
+    # /discover_blocks (Dynamic Capture's full-frame text discovery); the
+    # fixed-region calibration path stays on Tesseract either way.
+    "engine": "chromescreenai",
+    "chromescreenai": {"min_confidence": 0.5},
+}
+
 
 class Plugin:
     def __init__(self):
@@ -56,6 +69,8 @@ class Plugin:
         self.translation_error_path = self.data_dir / "last_translation_error.txt"
         self.translate_url_path = self.data_dir / "translate_url.txt"
         self.translation_settings_path = self.data_dir / "translation_settings.json"
+        self.ocr_settings_path = self.data_dir / "ocr_settings.json"
+        self.screenai_downloader = None
         self.active_blocks_path = self.data_dir / "active_blocks.json"
         self.dynamic_config_path = self.data_dir / "dynamic_config.json"
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
@@ -278,6 +293,99 @@ class Plugin:
             json.dumps(config, ensure_ascii=False) + "\n", encoding="utf-8"
         )
 
+    def _load_ocr_settings(self):
+        if not self.ocr_settings_path.exists():
+            return json.loads(json.dumps(_DEFAULT_OCR_SETTINGS))
+        try:
+            data = json.loads(self.ocr_settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return json.loads(json.dumps(_DEFAULT_OCR_SETTINGS))
+        settings = json.loads(json.dumps(_DEFAULT_OCR_SETTINGS))
+        for key, value in (data or {}).items():
+            if key in settings:
+                settings[key] = value
+        return settings
+
+    def _save_ocr_settings(self, settings):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.ocr_settings_path.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    async def get_ocr_settings(self):
+        return self._load_ocr_settings()
+
+    async def set_ocr_settings(self, settings):
+        old = self._load_ocr_settings()
+        new = dict(old)
+        for key, value in (settings or {}).items():
+            if key in new:
+                new[key] = value
+        self._save_ocr_settings(new)
+        decky.logger.info(f"PlayTranslate OCR settings updated: {new}")
+
+        # ocr_worker.py reads its engine choice from argv at spawn time
+        # (unlike translation settings, which capture_dynamic.py re-polls
+        # from a file) - a running worker won't pick up the change on its
+        # own, so restart it when the engine or its config actually moved.
+        if old.get("engine") != new.get("engine") or old.get("chromescreenai") != new.get("chromescreenai"):
+            await self._stop_ocr_worker()
+            engine_dir, _capture_py, _config_json = self._find_engine()
+            if engine_dir is not None:
+                await self._ensure_ocr_worker(engine_dir)
+        return new
+
+    def _get_screenai_downloader(self):
+        """Lazily loads screenai_downloader.py from the engine dir (same
+        dir ocr_worker.py/capture.py live in) and caches one instance so
+        in-flight download progress isn't lost on repeated calls. Not
+        imported at module load time because the engine dir isn't known
+        until _find_engine() resolves it, same reasoning as ocr_worker.py's
+        own load_module() for ocr_tesseract.py/translate_stub.py."""
+        if self.screenai_downloader is not None:
+            return self.screenai_downloader
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if engine_dir is None:
+            return None
+        module_path = engine_dir / "screenai_downloader.py"
+        if not module_path.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("playtranslate_screenai_downloader", module_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.screenai_downloader = module.ScreenAIDownloader(str(self.data_dir / "models"))
+        return self.screenai_downloader
+
+    async def get_screenai_status(self):
+        downloader = self._get_screenai_downloader()
+        if downloader is None:
+            return {
+                "installed": False, "size_bytes": 0, "approx_size_mb": 0,
+                "downloading": False, "progress": 0.0,
+                "error": "PlayTranslate engine directory not found",
+            }
+        return await asyncio.to_thread(downloader.get_status)
+
+    async def download_screenai(self):
+        downloader = self._get_screenai_downloader()
+        if downloader is None:
+            return {"ok": False, "error": "PlayTranslate engine directory not found"}
+        return {"ok": downloader.start_download()}
+
+    async def cancel_screenai_download(self):
+        downloader = self._get_screenai_downloader()
+        if downloader is not None:
+            downloader.cancel_download()
+        return {"ok": True}
+
+    async def delete_screenai(self):
+        downloader = self._get_screenai_downloader()
+        if downloader is None:
+            return {"ok": False, "error": "PlayTranslate engine directory not found"}
+        return {"ok": await asyncio.to_thread(downloader.delete)}
+
     def _normalize_translate_url(self, url):
         url = url.strip()
         parsed = parse.urlparse(url)
@@ -346,6 +454,7 @@ class Plugin:
             "ocr_worker_running": self._is_ocr_worker_running(),
             "ocr_worker_pid": self.ocr_worker_process.pid if self._is_ocr_worker_running() else None,
             "translation_engine": self._load_translation_settings().get("engine"),
+            "ocr_engine": self._load_ocr_settings().get("engine"),
             "translate_server_running": self._is_translate_server_running(),
             "translate_server_pid": self.translate_server_process.pid if self._is_translate_server_running() else None,
             "last_settled_mtime_ns": image_mtime_ns,
@@ -692,7 +801,26 @@ class Plugin:
         worker_log.write(f"\n--- PlayTranslate ocr_worker start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         worker_log.flush()
 
-        command = self._distrobox_python_command(worker_py, "--port", str(self._ocr_worker_port()))
+        ocr_settings = self._load_ocr_settings()
+        ocr_engine = ocr_settings.get("engine", "tesseract")
+        worker_args = ["--port", str(self._ocr_worker_port()), "--ocr-engine", ocr_engine]
+        if ocr_engine == "chromescreenai":
+            downloader = self._get_screenai_downloader()
+            if downloader is not None and downloader.is_installed():
+                # distrobox mounts the host home directory at the same
+                # absolute path, so this host-side path (under data_dir)
+                # resolves the same way inside the container - same
+                # assumption main.py already relies on for every image
+                # path it hands to ocr_worker.py's HTTP API.
+                worker_args += ["--screenai-model-dir", downloader.get_resources_dir()]
+            else:
+                decky.logger.warning(
+                    "OCR engine set to chromescreenai but the model files aren't downloaded yet; "
+                    "ocr_worker.py will fall back to tesseract for discovery until they are."
+                )
+            min_confidence = ocr_settings.get("chromescreenai", {}).get("min_confidence", 0.5)
+            worker_args += ["--screenai-min-confidence", str(min_confidence)]
+        command = self._distrobox_python_command(worker_py, *worker_args)
         env = self._subprocess_env()
         try:
             self.ocr_worker_process = subprocess.Popen(

@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package playtranslate.chrome_screen_ai;
+
+// Wire-compatible subset of Chromium's OCR output schema:
+// https://chromium.googlesource.com/chromium/src/+/main/services/screen_ai/proto/chrome_screen_ai.proto
+//
+// libchromescreenai.so's PerformOCR() serializes a VisualAnnotation using
+// that schema. Field numbers below must match it exactly for the wire
+// format to decode correctly; fields PlayTranslate doesn't read (words,
+// symbols, language, direction, content_type, ...) are simply omitted,
+// protobuf ignores whatever isn't declared here.
+
+message Rect {
+  int32 x = 1;
+  int32 y = 2;
+  int32 width = 3;
+  int32 height = 4;
+  float angle = 5;
+}
+
+message LineBox {
+  Rect bounding_box = 2;
+  string utf8_string = 3;
+  // Groups lines into the same visual block/paragraph as detected by the
+  // engine itself - Chrome Screen AI does this OCR-side, unlike Tesseract's
+  // SPARSE_TEXT mode which only ever returns flat lines.
+  int32 block_id = 5;
+  float confidence = 10;
+  int32 paragraph_id = 11;
+}
+
+message VisualAnnotation {
+  repeated LineBox lines = 2;
+}

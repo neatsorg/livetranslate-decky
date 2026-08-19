@@ -61,6 +61,32 @@ const ENGINE_OPTIONS = [
   { data: "deepl", label: "DeepL" },
 ];
 
+type OcrSettings = {
+  engine: string;
+  chromescreenai: { min_confidence?: number };
+};
+
+const OCR_ENGINE_OPTIONS = [
+  { data: "chromescreenai", label: "Chrome Screen AI (default, on-device)" },
+  { data: "tesseract", label: "Tesseract (debug fallback)" },
+];
+
+type ScreenAIStatus = {
+  installed: boolean;
+  size_bytes: number;
+  approx_size_mb: number;
+  downloading: boolean;
+  progress: number;
+  error?: string | null;
+};
+
+const getOcrSettings = callable<[], OcrSettings>("get_ocr_settings");
+const setOcrSettings = callable<[Partial<OcrSettings>], OcrSettings>("set_ocr_settings");
+const getScreenaiStatus = callable<[], ScreenAIStatus>("get_screenai_status");
+const downloadScreenai = callable<[], { ok: boolean; error?: string }>("download_screenai");
+const cancelScreenaiDownload = callable<[], { ok: boolean }>("cancel_screenai_download");
+const deleteScreenai = callable<[], { ok: boolean; error?: string }>("delete_screenai");
+
 const LANGUAGE_OPTIONS = [
   { data: "English", label: "English" },
   { data: "Japanese", label: "Japanese" },
@@ -1080,6 +1106,8 @@ function Content() {
   const [geminiModelInput, setGeminiModelInput] = useState("");
   const [deeplKeyInput, setDeeplKeyInput] = useState("");
   const [googleCloudKeyInput, setGoogleCloudKeyInput] = useState("");
+  const [ocrSettings, setOcrSettingsState] = useState<OcrSettings | undefined>();
+  const [screenaiStatus, setScreenaiStatus] = useState<ScreenAIStatus | undefined>();
 
   useEffect(() => {
     (async () => {
@@ -1092,9 +1120,41 @@ function Content() {
     })();
   }, []);
 
+  useEffect(() => {
+    (async () => {
+      setOcrSettingsState(await getOcrSettings());
+    })();
+  }, []);
+
+  // Polls continuously (not just while downloading) so switching to the OCR
+  // tab always shows current install state without an extra round trip -
+  // same "just keep polling" approach the dynamic-status poll above uses.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const next = await getScreenaiStatus();
+        if (!cancelled) setScreenaiStatus(next);
+      } catch {
+        // transient RPC hiccup - keep the last known status, try again next tick
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const applyTranslationSettings = async (patch: Partial<TranslationSettings>) => {
     const next = await setTranslationSettings(patch);
     setTranslationSettingsState(next);
+  };
+
+  const applyOcrSettings = async (patch: Partial<OcrSettings>) => {
+    const next = await setOcrSettings(patch);
+    setOcrSettingsState(next);
   };
 
   const commitGeminiConfig = () => {
@@ -1554,6 +1614,109 @@ function Content() {
     </>
   );
 
+  const ocrTabContent = (
+    <>
+    <PanelSection title="OCR Engine">
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8, marginBottom: "4px" }}>
+          Controls Dynamic Capture's full-frame text discovery only. The
+          fixed-region calibration path always uses Tesseract.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DropdownItem
+          label="Engine"
+          rgOptions={OCR_ENGINE_OPTIONS}
+          selectedOption={ocrSettings?.engine ?? "chromescreenai"}
+          onChange={(option) => applyOcrSettings({ engine: String(option.data) })}
+        />
+      </PanelSectionRow>
+      {ocrSettings?.engine === "chromescreenai" && (
+        <>
+          <PanelSectionRow>
+            <div style={{ fontSize: "11px", opacity: 0.8 }}>
+              On-device neural OCR (Chromium's accessibility screen reader
+              engine). Groups detected text into blocks itself, no manual
+              region calibration needed. Downloads ~{screenaiStatus?.approx_size_mb ?? 120}MB on first use.
+            </div>
+          </PanelSectionRow>
+          {screenaiStatus?.installed && (
+            <PanelSectionRow>
+              <div style={{ fontSize: "11px", opacity: 0.8 }}>
+                Installed ({Math.round((screenaiStatus.size_bytes / 1024 / 1024) * 10) / 10} MB)
+              </div>
+            </PanelSectionRow>
+          )}
+          {screenaiStatus?.downloading && (
+            <PanelSectionRow>
+              <div
+                style={{
+                  height: "6px",
+                  borderRadius: "3px",
+                  background: "rgba(255,255,255,0.15)",
+                  overflow: "hidden",
+                  margin: "4px 0",
+                }}
+              >
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${Math.round((screenaiStatus.progress ?? 0) * 100)}%`,
+                    background: "#1a9fff",
+                  }}
+                />
+              </div>
+              <div style={{ fontSize: "11px", opacity: 0.8 }}>
+                Downloading… {Math.round((screenaiStatus.progress ?? 0) * 100)}%
+              </div>
+            </PanelSectionRow>
+          )}
+          {screenaiStatus?.error && (
+            <PanelSectionRow>
+              <div style={{ fontSize: "11px", color: "#ff6b6b" }}>{screenaiStatus.error}</div>
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            {!screenaiStatus?.installed && !screenaiStatus?.downloading && (
+              <ButtonItem
+                layout="below"
+                onClick={async () => {
+                  await downloadScreenai();
+                  setScreenaiStatus(await getScreenaiStatus());
+                }}
+              >
+                Download
+              </ButtonItem>
+            )}
+            {screenaiStatus?.downloading && (
+              <ButtonItem
+                layout="below"
+                onClick={async () => {
+                  await cancelScreenaiDownload();
+                  setScreenaiStatus(await getScreenaiStatus());
+                }}
+              >
+                Cancel
+              </ButtonItem>
+            )}
+            {screenaiStatus?.installed && !screenaiStatus?.downloading && (
+              <ButtonItem
+                layout="below"
+                onClick={async () => {
+                  await deleteScreenai();
+                  setScreenaiStatus(await getScreenaiStatus());
+                }}
+              >
+                Delete
+              </ButtonItem>
+            )}
+          </PanelSectionRow>
+        </>
+      )}
+    </PanelSection>
+    </>
+  );
+
   // @decky/ui's <Tabs> renders its content pane with a height that only
   // resolves against a percentage/flex-sized ancestor - something Steam's
   // own QAM tab views get for free but a plugin's `content` root doesn't
@@ -1577,8 +1740,15 @@ function Content() {
             Translation
           </ButtonItem>
         </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={activeTab === "ocr"} onClick={() => setActiveTab("ocr")}>
+            OCR
+          </ButtonItem>
+        </PanelSectionRow>
       </PanelSection>
-      {activeTab === "main" ? mainTabContent : translationTabContent}
+      {activeTab === "main" && mainTabContent}
+      {activeTab === "translation" && translationTabContent}
+      {activeTab === "ocr" && ocrTabContent}
     </>
   );
 }
