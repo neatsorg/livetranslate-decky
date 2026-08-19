@@ -23,7 +23,7 @@ Steam Deck.
 This is now a single self-contained folder:
 
 ```text
-playtranslate-decky/
+livetranslate-decky/
   plugin.json
   main.py           # Decky plugin backend
   src/index.tsx      # frontend
