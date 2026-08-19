@@ -1,6 +1,7 @@
 import {
   ButtonItem,
   DropdownItem,
+  Navigation,
   PanelSection,
   PanelSectionRow,
   TextField,
@@ -11,8 +12,8 @@ import { callable, definePlugin, routerHook } from "@decky/api";
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { FaLanguage } from "react-icons/fa";
+import { SiKofi } from "react-icons/si";
 import { CompositionRequest, UIComposition } from "./Composition";
-import { openRegionCalibration } from "./Calibration";
 import { openKeybindings } from "./Keybindings";
 import { openRoiCropEditor } from "./RoiCrop";
 
@@ -99,14 +100,6 @@ const LANGUAGE_OPTIONS = [
   { data: "German", label: "German" },
 ];
 
-type AiServerStatus = {
-  ok: boolean;
-  url: string;
-  status?: number;
-  body?: string;
-  error?: string;
-};
-
 type HidrawTestResult = {
   success: boolean;
   device?: string;
@@ -129,12 +122,9 @@ type ActiveBlocksState = {
   capture_height: number | null;
 };
 
-const startCapture = callable<[], CaptureStatus>("start_capture");
-const stopCapture = callable<[], CaptureStatus>("stop_capture");
 const getStatus = callable<[], CaptureStatus>("status");
 const translateLatest = callable<[], CaptureStatus>("translate_latest");
 const testHidrawButtonState = callable<[], HidrawTestResult>("test_hidraw_button_state");
-const checkAiServer = callable<[], AiServerStatus>("check_ai_server");
 const getActiveBlocks = callable<[], ActiveBlocksState>("get_active_blocks");
 const getTranslationSettings = callable<[], TranslationSettings>("get_translation_settings");
 const setTranslationSettings = callable<[Partial<TranslationSettings>], TranslationSettings>(
@@ -233,6 +223,14 @@ const tryCloseQuickAccessMenu = () => {
     // capture_dynamic.py are the real safety net if this doesn't work.
   }
 };
+
+// Ko-fi's own floating-chat overlay-widget script never renders inside
+// Decky's QAM (silently no-ops - almost certainly Steam's CSP blocking the
+// remote <script src>, same conclusion the Decky-Translator reference
+// plugin's own Ko-fi button implementation implies by avoiding script
+// injection entirely). Handing off to the system browser instead is the
+// approach confirmed working there.
+const KOFI_URL = "https://ko-fi.com/neatsorg";
 
 /** Dynamic-engine output counts as "live" only within this window - past it,
  * fall back to the single-region pipeline's status().translation so a stale
@@ -402,7 +400,7 @@ function startHotkeyPolling() {
         if (refreshed.error) {
           console.warn(`refresh dynamic capture: ${refreshed.error}`);
         } else {
-          showToast("PlayTranslate: refreshed");
+          showToast("LiveTranslator-kun: refreshed");
         }
       } else if (binding.command === "pause_resume") {
         const toggled = await toggleDynamicPause();
@@ -410,7 +408,7 @@ function startHotkeyPolling() {
           console.warn(`toggle dynamic pause: ${toggled.error}`);
         } else {
           const suffix = whileHeld ? " (release now)" : "";
-          showToast(toggled.paused ? `PlayTranslate: paused${suffix}` : `PlayTranslate: resumed${suffix}`);
+          showToast(toggled.paused ? `LiveTranslator-kun: paused${suffix}` : `LiveTranslator-kun: resumed${suffix}`);
         }
       }
     } finally {
@@ -922,26 +920,26 @@ function TapTranslateOverlay() {
     try {
       const blocksState = await getActiveBlocks();
       if (!blocksState.capture_width || !blocksState.capture_height) {
-        toast("PlayTranslate: capture size not known yet");
+        toast("LiveTranslator-kun: capture size not known yet");
         return;
       }
       const x = Math.round(xPct * blocksState.capture_width);
       const y = Math.round(yPct * blocksState.capture_height);
       const result = await requestTapTranslate(x, y);
       if (!result.ok) {
-        toast(`PlayTranslate: ${result.error ?? "tap failed"}`);
+        toast(`LiveTranslator-kun: ${result.error ?? "tap failed"}`);
       } else if (result.matched) {
         const text = (result.translation || result.text || "").trim();
         if (text) {
           window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text } }));
         } else {
-          toast("PlayTranslate: no text here");
+          toast("LiveTranslator-kun: no text here");
         }
       } else {
-        toast("PlayTranslate: no text here");
+        toast("LiveTranslator-kun: no text here");
       }
     } catch (error) {
-      toast(`PlayTranslate: ${error instanceof Error ? error.message : String(error)}`);
+      toast(`LiveTranslator-kun: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -1022,7 +1020,7 @@ function TapTranslateOverlay() {
             pointerEvents: "none",
           }}
         >
-          PlayTranslate: タップして翻訳
+          LiveTranslator-kun: タップして翻訳
         </div>
       </div>
     </>
@@ -1219,10 +1217,6 @@ function Content() {
   const [dynamicStatus, setDynamicStatus] = useState<DynamicStatus | undefined>();
   const [regionModeStatus, setRegionModeStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
-  const [inputTest, setInputTest] = useState<string>("not tested");
-  const [aiStatus, setAiStatus] = useState<string>("not checked");
-  const [hudVisible, setHudVisible] = useState(false);
-  const hudTimerRef = useRef<number | null>(null);
   const [activeTab, setActiveTab] = useState("main");
   const [translationSettings, setTranslationSettingsState] = useState<TranslationSettings | undefined>();
   const [geminiKeyInput, setGeminiKeyInput] = useState("");
@@ -1299,19 +1293,6 @@ function Content() {
     setDynamicStatus(nextDynamic);
   };
 
-  const runAction = async (action: () => Promise<CaptureStatus>, title: string) => {
-    setBusy(true);
-    try {
-      const next = await action();
-      setStatus(next);
-      if (next.error) {
-        console.warn(`${title}: ${next.error}`);
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const runDynamicAction = async (action: () => Promise<DynamicStatus>, title: string) => {
     setBusy(true);
     try {
@@ -1325,81 +1306,11 @@ function Content() {
     }
   };
 
-  const runInputTest = async () => {
-    setBusy(true);
-    setInputTest("testing...");
-    try {
-      const result = await testHidrawButtonState();
-      if (!result.success) {
-        setInputTest(`error: ${result.error ?? "unknown"}`);
-      } else if (result.buttons.length === 0) {
-        setInputTest(`no buttons (${result.device ?? "device unknown"})`);
-      } else {
-        setInputTest(`${result.buttons.join(", ")} (${result.device ?? "device unknown"})`);
-      }
-    } catch (error) {
-      setInputTest(`error: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runAiServerTest = async () => {
-    setBusy(true);
-    setAiStatus("checking...");
-    try {
-      const result = await checkAiServer();
-      if (result.ok) {
-        setAiStatus(`ok: ${result.url}`);
-      } else {
-        setAiStatus(`error: ${result.error ?? result.url}`);
-      }
-    } catch (error) {
-      setAiStatus(`error: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const showHud = (durationMs = 9000) => {
-    const text = status?.translation?.trim() ?? "";
-    window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text } }));
-    setHudVisible(true);
-    if (hudTimerRef.current !== null) {
-      window.clearTimeout(hudTimerRef.current);
-    }
-    hudTimerRef.current = window.setTimeout(() => {
-      setHudVisible(false);
-      hudTimerRef.current = null;
-    }, durationMs);
-  };
-
-  const hideHud = () => {
-    window.dispatchEvent(new CustomEvent("playtranslate-hide-hud"));
-    setHudVisible(false);
-    if (hudTimerRef.current !== null) {
-      window.clearTimeout(hudTimerRef.current);
-      hudTimerRef.current = null;
-    }
-  };
-
   useEffect(() => {
     refresh();
     const timer = window.setInterval(refresh, 3000);
     return () => window.clearInterval(timer);
   }, []);
-
-  useEffect(() => {
-    return () => {
-      if (hudTimerRef.current !== null) {
-        window.clearTimeout(hudTimerRef.current);
-      }
-    };
-  }, []);
-
-  const stateText = status?.running
-    ? `Running${status.pid ? ` (${status.pid})` : ""}`
-    : "Stopped";
 
   const dynamicStateText = dynamicStatus?.running
     ? `Running${dynamicStatus.pid ? ` (${dynamicStatus.pid})` : ""}${dynamicStatus.paused ? " / paused" : ""}`
@@ -1407,248 +1318,29 @@ function Content() {
 
   const mainTabContent = (
     <>
-    <PanelSection title="PlayTranslate">
-      <PanelSectionRow>
-        <div>{stateText}</div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          disabled={busy || status?.running === true}
-          layout="below"
-          onClick={() => runAction(startCapture, "PlayTranslate started")}
-        >
-          Start Capture
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          disabled={busy || status?.running !== true}
-          layout="below"
-          onClick={() => runAction(stopCapture, "PlayTranslate stopped")}
-        >
-          Stop Capture
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={busy} layout="below" onClick={refresh}>
-          Refresh Status
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          disabled={busy}
-          layout="below"
-          onClick={() => runAction(translateLatest, "PlayTranslate translated")}
-        >
-          Translate Latest
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={busy} layout="below" onClick={runInputTest}>
-          Test L4 Input
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={busy} layout="below" onClick={runAiServerTest}>
-          Test AI Server
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={!status?.translation} layout="below" onClick={() => showHud()}>
-          Show HUD
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={!hudVisible} layout="below" onClick={hideHud}>
-          Hide HUD
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={busy} layout="below" onClick={() => openRegionCalibration()}>
-          Calibrate Regions
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem disabled={busy} layout="below" onClick={() => openKeybindings()}>
-          Configure Keybindings
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={{ fontSize: "12px", opacity: 0.8, overflowWrap: "anywhere" }}>
-          <div>Engine: {status?.engine_dir ?? "not found"}</div>
-          <div>Log: {status?.log_path ?? "-"}</div>
-          <div>Translation: {status?.translation_path ?? "-"}</div>
-          <div>AI URL: {status?.translate_url ?? "-"}</div>
-          <div>AI: {aiStatus}</div>
-          <div>
-            Worker: {status?.translation_worker ? (status.translation_in_progress ? "translating" : "running") : "stopped"}
-            {status?.translation_stale ? " / stale" : ""}
-          </div>
-          <div>Input: {inputTest}</div>
-          <div>HUD: {hudVisible ? "visible" : "hidden"}</div>
-        </div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <pre
-          style={{
-            maxHeight: "160px",
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            fontSize: "14px",
-            lineHeight: "18px",
-          }}
-        >
-          {status?.translation || status?.translation_error || ""}
-        </pre>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <pre
-          style={{
-            maxHeight: "220px",
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            fontSize: "11px",
-            lineHeight: "14px",
-          }}
-        >
-          {status?.error ?? status?.log_tail ?? ""}
-        </pre>
-      </PanelSectionRow>
-    </PanelSection>
-    <PanelSection title="PlayTranslate — Dynamic (Beta)">
+    <PanelSection title="Capture Control">
       <PanelSectionRow>
         <div>{dynamicStateText}</div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={{ fontSize: "11px", opacity: 0.8 }}>
-          Wide-area multi-block discovery. Mutually exclusive with regular
-          capture above — starting one stops the other (see
-          PHASE_A_HANDOFF.md).
-        </div>
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem
           disabled={busy || dynamicStatus?.running === true}
           layout="below"
           onClick={() => {
-            runDynamicAction(startDynamicCapture, "PlayTranslate dynamic started");
+            runDynamicAction(startDynamicCapture, "LiveTranslator-kun dynamic started");
             tryCloseQuickAccessMenu();
           }}
         >
-          Start Dynamic Capture
+          Start Capture
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem
           disabled={busy || dynamicStatus?.running !== true}
           layout="below"
-          onClick={() => runDynamicAction(stopDynamicCapture, "PlayTranslate dynamic stopped")}
+          onClick={() => runDynamicAction(stopDynamicCapture, "LiveTranslator-kun dynamic stopped")}
         >
-          Stop Dynamic Capture
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={{ fontSize: "11px", opacity: 0.8 }}>
-          If the display looks wrong (garbled/overlapping boxes, stuck on
-          old text) and doesn't fix itself in a few seconds, use this -
-          clears what's shown and restarts detection from scratch. Safe to
-          press repeatedly; presses queue instead of interfering with each
-          other.
-        </div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          disabled={busy || dynamicStatus?.running !== true}
-          layout="below"
-          onClick={() => runDynamicAction(refreshDynamicCapture, "PlayTranslate dynamic refreshed")}
-        >
-          Refresh Dynamic Capture
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={{ fontSize: "11px", opacity: 0.8 }}>
-          Stops/resumes translation work without restarting the process -
-          use when a noisy scene is producing too much garbled output and
-          you just want it to stop for a while. Also bound to L4 while
-          Dynamic Capture is running: short tap = Refresh above, long hold
-          (~1s) = this.
-        </div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={{ fontSize: "11px", opacity: 0.8 }}>
-          While paused, hold L4+L2 and long-press-tap the screen to
-          translate just the block under your finger (shown in the HUD).
-          Touch is only captured for the duration L4+L2 are held.
-        </div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          disabled={busy || dynamicStatus?.running !== true}
-          layout="below"
-          onClick={async () => {
-            setBusy(true);
-            try {
-              const result = await toggleDynamicPause();
-              if (result.error) {
-                console.warn(`toggle dynamic pause: ${result.error}`);
-              }
-              const next = await getDynamicStatus();
-              setDynamicStatus(next);
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {dynamicStatus?.paused ? "Resume Dynamic Capture" : "Pause Dynamic Capture"}
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <pre
-          style={{
-            maxHeight: "160px",
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            fontSize: "12px",
-            lineHeight: "16px",
-          }}
-        >
-          {(dynamicStatus?.blocks ?? [])
-            .map((b) => `#${b.id} ${b.translation || b.text}`)
-            .join("\n") || "(no blocks)"}
-        </pre>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <pre
-          style={{
-            maxHeight: "160px",
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            fontSize: "11px",
-            lineHeight: "14px",
-          }}
-        >
-          {dynamicStatus?.error ?? dynamicStatus?.log_tail ?? ""}
-        </pre>
-      </PanelSectionRow>
-    </PanelSection>
-    <PanelSection title="PlayTranslate — Dynamic (Region)">
-      <PanelSectionRow>
-        <div style={{ fontSize: "11px", opacity: 0.8 }}>
-          Same engine as above, restricted to one hand-picked rectangle (e.g.
-          the subtitle box) instead of scanning the whole screen. Uses the
-          same process, so "Stop Dynamic Capture" above stops this too.
-        </div>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          disabled={busy}
-          layout="below"
-          onClick={() => {
-            tryCloseQuickAccessMenu();
-            openRoiCropEditor();
-          }}
-        >
-          Configure Region…
+          Stop Capture
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
@@ -1661,13 +1353,13 @@ function Content() {
             try {
               const saved = await getDynamicRoi();
               if (!saved.ok || !saved.roi) {
-                setRegionModeStatus(saved.error || "no region configured yet - use Configure Region first");
+                setRegionModeStatus(saved.error || "no region configured yet - use Region Mode Config first");
                 return;
               }
               // Fired before the start RPC, not after (matching the wide
-              // "Start Dynamic Capture" button above) - closing the QAM
-              // only after the new process is already capturing left its
-              // own on-screen text as fair game for the engine's first
+              // "Start Capture" button above) - closing the QAM only after
+              // the new process is already capturing left its own
+              // on-screen text as fair game for the engine's first
               // (self-confirming, non-retried) read. start_dynamic_capture()
               // also self-stops+restarts when the requested mode differs
               // from whatever's currently running, which is what lets this
@@ -1689,6 +1381,53 @@ function Content() {
           <div style={{ fontSize: "11px", color: "#ff8a80" }}>{regionModeStatus}</div>
         </PanelSectionRow>
       )}
+    </PanelSection>
+    <PanelSection title="Capture Settings">
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setActiveTab("translation")}>
+          Translation Settings
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setActiveTab("ocr")}>
+          OCR Settings
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="Other Settings">
+      <PanelSectionRow>
+        <ButtonItem disabled={busy} layout="below" onClick={() => openKeybindings()}>
+          Key Bindings
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy}
+          layout="below"
+          onClick={() => {
+            tryCloseQuickAccessMenu();
+            openRoiCropEditor();
+          }}
+        >
+          Region Mode Config
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          onClick={() => {
+            Navigation.CloseSideMenus();
+            Navigation.NavigateToExternalWeb(KOFI_URL);
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+            <SiKofi style={{ fontSize: "13px" }} />
+            <span>Support</span>
+          </div>
+        </ButtonItem>
+      </PanelSectionRow>
     </PanelSection>
     </>
   );
@@ -1767,8 +1506,8 @@ function Content() {
       {translationSettings?.engine === "ollama" && (
         <PanelSectionRow>
           <div style={{ fontSize: "11px", opacity: 0.8 }}>
-            Uses the LAN server URL configured via translate_url.txt / PLAYTRANSLATE_TRANSLATE_URL
-            (see AI URL on the Main tab). Unaffected by this screen.
+            Uses the LAN server URL configured via translate_url.txt / PLAYTRANSLATE_TRANSLATE_URL.
+            Unaffected by this screen.
           </div>
         </PanelSectionRow>
       )}
@@ -1914,28 +1653,31 @@ function Content() {
   // state-toggled pair of buttons sidesteps that entirely - no absolute
   // positioning or percentage-height math involved, just normal document
   // flow, same as this panel used before tabs were added.
+  const backButton = (
+    <PanelSection>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setActiveTab("main")}>
+          ← Back
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+
   return (
     <>
-      <PanelSection>
-        <PanelSectionRow>
-          <ButtonItem layout="below" disabled={activeTab === "main"} onClick={() => setActiveTab("main")}>
-            Main
-          </ButtonItem>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <ButtonItem layout="below" disabled={activeTab === "translation"} onClick={() => setActiveTab("translation")}>
-            Translation
-          </ButtonItem>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <ButtonItem layout="below" disabled={activeTab === "ocr"} onClick={() => setActiveTab("ocr")}>
-            OCR
-          </ButtonItem>
-        </PanelSectionRow>
-      </PanelSection>
       {activeTab === "main" && mainTabContent}
-      {activeTab === "translation" && translationTabContent}
-      {activeTab === "ocr" && ocrTabContent}
+      {activeTab === "translation" && (
+        <>
+          {backButton}
+          {translationTabContent}
+        </>
+      )}
+      {activeTab === "ocr" && (
+        <>
+          {backButton}
+          {ocrTabContent}
+        </>
+      )}
     </>
   );
 }
@@ -2018,8 +1760,8 @@ export default definePlugin(() => {
   routerHook.addGlobalComponent("PlayTranslateTapOverlay", () => <TapTranslateOverlay />);
 
   return {
-    name: "PlayTranslate",
-    titleView: <div className={staticClasses.Title}>PlayTranslate</div>,
+    name: "LiveTranslator-kun",
+    titleView: <div className={staticClasses.Title}>LiveTranslator-kun</div>,
     content: <Content />,
     icon: <FaLanguage />,
     onDismount() {
