@@ -57,11 +57,11 @@ type TranslationSettings = {
 };
 
 const ENGINE_OPTIONS = [
-  { data: "ollama", label: "Ollama (LAN server)" },
-  { data: "gemini", label: "Gemini" },
-  { data: "google", label: "Google Translate (free)" },
   { data: "google_cloud", label: "Google Cloud Translation (paid, API key)" },
-  { data: "deepl", label: "DeepL" },
+  { data: "deepl", label: "DeepL (paid, API key)" },
+  { data: "gemini", label: "Gemini AI (paid, API key)" },
+  { data: "ollama", label: "Ollama (local server)" },
+  { data: "google", label: "Google Translate (free)" },
 ];
 
 type OcrSettings = {
@@ -1534,6 +1534,14 @@ function Content() {
           selectedOption={translationSettings?.target_lang ?? "Japanese"}
           onChange={(option) => applyTranslationSettings({ target_lang: String(option.data) })}
         />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          Under construction: only Source = English / Target = Japanese is
+          tested and supported today. OCR may pick up other scripts, but the
+          translation prompts (especially Ollama/Gemini) are hand-tuned for
+          English source text, so other language pairs aren't supported yet.
+        </div>
       </PanelSectionRow>
     </PanelSection>
     </>
