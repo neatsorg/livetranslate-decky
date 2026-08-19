@@ -57,6 +57,7 @@ class Plugin:
         self.dynamic_config_path = self.data_dir / "dynamic_config.json"
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
         self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
+        self.dynamic_qam_open_flag_path = self.data_dir / "dynamic_qam_open.flag"
         self.tap_request_path = self.data_dir / "tap_request.json"
         self.tap_result_path = self.data_dir / "tap_result.json"
         self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
@@ -1368,6 +1369,10 @@ class Plugin:
         except FileNotFoundError:
             pass
         try:
+            self.dynamic_qam_open_flag_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
             self.tap_request_path.unlink()
         except FileNotFoundError:
             pass
@@ -1410,6 +1415,8 @@ class Plugin:
             str(self.active_blocks_path),
             "--pause-flag",
             str(self.dynamic_pause_flag_path),
+            "--qam-open-flag",
+            str(self.dynamic_qam_open_flag_path),
             "--tap-request",
             str(self.tap_request_path),
             "--tap-result",
@@ -1507,6 +1514,7 @@ class Plugin:
         return {
             "running": running,
             "paused": self.dynamic_pause_flag_path.exists(),
+            "qam_open": self.dynamic_qam_open_flag_path.exists(),
             "pid": self.dynamic_process.pid if running else None,
             "returncode": None if running or self.dynamic_process is None else self.dynamic_process.returncode,
             "log_path": str(self.dynamic_log_path),
@@ -1557,6 +1565,32 @@ class Plugin:
         }
         self.active_blocks_path.write_text(json.dumps(blanked), encoding="utf-8")
         return {"paused": True}
+
+    async def set_dynamic_qam_open(self, is_open: bool):
+        """Driven by index.tsx polling Steam's own openSideMenu state
+        (window.SteamUIStore...m_eOpenSideMenu) live, not by any button
+        click - see PHASE_A_HANDOFF.md's 2026-08-19 QAM-cascade writeup.
+        Deliberately a separate flag from dynamic_pause_flag_path/
+        toggle_dynamic_pause() above rather than reusing it: this is an
+        automatic, high-frequency signal tied purely to QAM visibility, and
+        must not be able to clobber (or be clobbered by) a user's own
+        manual pause/resume state - capture_dynamic.py's on_sample() checks
+        both flags independently. Unlike toggle_dynamic_pause(), this never
+        touches active_blocks.json - the point is to be invisible to
+        whatever's already correctly displayed, not to blank it, since the
+        QAM opening/closing isn't a user request about the translation
+        display at all.
+        """
+        if not self._is_dynamic_running():
+            return {"qam_open": False}
+        if is_open:
+            self.dynamic_qam_open_flag_path.touch()
+        else:
+            try:
+                self.dynamic_qam_open_flag_path.unlink()
+            except FileNotFoundError:
+                pass
+        return {"qam_open": is_open}
 
     async def request_tap_translate(self, x, y):
         """Tap-to-translate: the frontend's L4+L2-hold + touch-long-press

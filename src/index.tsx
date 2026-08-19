@@ -116,6 +116,7 @@ const setTranslationSettings = callable<[Partial<TranslationSettings>], Translat
 type DynamicStatus = {
   running: boolean;
   paused?: boolean;
+  qam_open?: boolean;
   pid: number | null;
   returncode: number | null;
   log_path: string;
@@ -140,6 +141,7 @@ const startDynamicCapture = callable<[], DynamicStatus>("start_dynamic_capture")
 const stopDynamicCapture = callable<[], DynamicStatus>("stop_dynamic_capture");
 const refreshDynamicCapture = callable<[], DynamicStatus>("refresh_dynamic_capture");
 const toggleDynamicPause = callable<[], PauseToggleResult>("toggle_dynamic_pause");
+const setDynamicQamOpen = callable<[boolean], { qam_open: boolean }>("set_dynamic_qam_open");
 const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
 const requestTapTranslate = callable<[number, number], TapResult>("request_tap_translate");
 
@@ -943,6 +945,43 @@ function PositionedOverlay() {
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+    };
+  }, []);
+
+  // Auto-suppresses capture while the QAM sidebar is open, regardless of
+  // which button (if any) the user is about to press inside it - see
+  // PHASE_A_HANDOFF.md's 2026-08-19 section. Confirmed live via steam-debug
+  // that Steam's own gamepad-UI window tracks this as a plain synchronous
+  // property, no findAllModules search needed unlike tryCloseQuickAccessMenu
+  // above: window.SteamUIStore.m_WindowStore.GamepadUIMainWindowInstance.
+  // m_MenuStore.m_eOpenSideMenu, where 0 = closed, 1 = MainMenu, 2 =
+  // QuickAccess. Polled fast (300ms) rather than at the 1500ms block-poll
+  // cadence, since the whole point is to close the false-capture window
+  // between the QAM opening and the user finding/pressing a button inside
+  // it - a slower poll would just shrink that window, not close it.
+  // set_dynamic_qam_open() is a no-op read on the backend if this ever
+  // fails to resolve (optional chaining below falls through to `false`,
+  // i.e. "not open") - failing open here would silently wedge capture off
+  // forever if this property ever gets renamed by a Steam UI update, which
+  // is a worse failure mode than losing this protection.
+  useEffect(() => {
+    let lastOpen = false;
+    const poll = () => {
+      const menuId = (window as any).SteamUIStore?.m_WindowStore?.GamepadUIMainWindowInstance?.m_MenuStore
+        ?.m_eOpenSideMenu;
+      const isOpen = typeof menuId === "number" && menuId !== 0;
+      if (isOpen !== lastOpen) {
+        lastOpen = isOpen;
+        setDynamicQamOpen(isOpen).catch(() => {});
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 300);
+    return () => {
+      window.clearInterval(timer);
+      if (lastOpen) {
+        setDynamicQamOpen(false).catch(() => {});
+      }
     };
   }, []);
 

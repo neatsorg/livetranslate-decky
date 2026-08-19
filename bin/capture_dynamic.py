@@ -804,6 +804,20 @@ class DynamicCaptureRunner:
         finally:
             buffer.unmap(map_info)
 
+        if self.args.qam_open_flag and self.args.qam_open_flag.exists():
+            # QAM sidebar is currently open (index.tsx polls Steam's own
+            # openSideMenu state and sets this flag live - see
+            # PHASE_A_HANDOFF.md's 2026-08-19 section). Unlike --pause-flag
+            # below, this skips tap-to-translate too: while the QAM is open
+            # a touchscreen tap lands on the QAM's own UI, not the game, so
+            # there's no valid tap coordinate to service. Still pull/map/
+            # unmap every frame above to keep the GStreamer pipeline
+            # flowing without a backlog. Deliberately does not touch
+            # active_blocks.json - the whole point is to be invisible to
+            # whatever's already correctly displayed, unlike a user-
+            # requested pause.
+            return Gst.FlowReturn.OK
+
         if self.args.pause_flag and self.args.pause_flag.exists():
             # User-triggered pause (L4 long-press / QAM toggle - see
             # main.py's toggle_dynamic_pause()). Still pull/map/unmap every
@@ -1020,6 +1034,14 @@ def main():
         "--pause-flag",
         type=Path,
         help="If this path exists, skip all discovery/tracking/translation work each frame (see on_sample()). Created/removed by main.py's toggle_dynamic_pause().",
+    )
+    parser.add_argument(
+        "--qam-open-flag",
+        type=Path,
+        help="If this path exists, skip all discovery/tracking/translation work each frame, same as --pause-flag but without servicing tap-to-translate "
+        "(a tap now lands on the QAM UI, not the game). Created/removed by main.py's set_dynamic_qam_open(), driven by index.tsx polling Steam's own "
+        "window.SteamUIStore...m_eOpenSideMenu - see PHASE_A_HANDOFF.md's 2026-08-19 QAM-cascade writeup for why this exists as a separate flag from "
+        "--pause-flag rather than reusing it: a user-initiated pause and an automatic QAM-open suppression should not be able to clobber each other.",
     )
     parser.add_argument(
         "--tap-request",
