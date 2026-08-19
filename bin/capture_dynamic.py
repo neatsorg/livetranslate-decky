@@ -33,6 +33,11 @@ tap-to-select will later just jump a block to the front directly).
 Process supervision (starting/stopping this alongside capture.py, keeping
 --output pointed at the right file) is still not wired into main.py -
 this is deliberately still run by hand for validation before that cutover.
+
+--fixed-roi swaps step 2 above for a single hand-picked region instead of
+full-frame discovery, replacing capture.py's --diff mode with this same
+settle/re-OCR/translate pipeline restricted to one crop - see
+_fixed_roi_block() and the top of maybe_discover().
 """
 import argparse
 import importlib.util
@@ -413,7 +418,57 @@ class DynamicCaptureRunner:
             regions.append((x0, y0, x1, y0 + box_height))
         return regions
 
+    def _fixed_roi_block(self, width, height):
+        roi = self.args.fixed_roi
+        x0 = int(width * roi["x_pct"] / 100)
+        y0 = int(height * roi["y_pct"] / 100)
+        x1 = int(width * (roi["x_pct"] + roi["width_pct"]) / 100)
+        y1 = int(height * (roi["y_pct"] + roi["height_pct"]) / 100)
+        return {"id": 0, "text": "", "conf": 100.0, "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1}}
+
     def maybe_discover(self, raw, width, height, reason="periodic"):
+        if self.args.fixed_roi:
+            # No full-frame OCR at all in this mode - the region is given,
+            # not discovered. Throttled the same way as the HTTP discovery
+            # path below (discovery_min_interval + self.discovering guard),
+            # and deliberately stays in state "need_discovery" - so
+            # on_sample() keeps calling this every frame - until the first
+            # re-OCR actually confirms (succeeds or fails cleanly), not
+            # just until the region is seeded. Confirmed live: seeding
+            # always succeeds instantly, but the very first reocr_block()
+            # call can lose a race against ocr_worker still cold-starting
+            # (URLError: connection refused) - without this retry, that one
+            # failed attempt left the block silently untracked forever,
+            # since nothing about its pixels changes again until the
+            # on-screen text itself does. See the block-display design
+            # discussion for why wide discovery gets this retry for free
+            # (it never leaves "need_discovery" on a failed attempt either)
+            # and this mode needs the same treatment explicitly.
+            now = time.monotonic()
+            if self.discovering or now - self.last_discovery_attempt < self.discovery_min_interval:
+                return
+            self.last_discovery_attempt = now
+            self.discovering = True
+            try:
+                if self.tracker is None:
+                    self.tracker = MultiRegionTracker(width, height)
+                if not self.tracker.blocks:
+                    block = self._fixed_roi_block(width, height)
+                    added, _updated = self.tracker.merge_regions([block], raw, width, height)
+                    if added:
+                        self.log(f"[fixed-roi:{reason}] seeded region bbox={block['bbox']}")
+                unconfirmed = [b for b in self.tracker.blocks.values() if b.block_id not in self.block_meta]
+                if unconfirmed:
+                    self.reocr_block(unconfirmed[0], raw, width, height)
+                    self.write_active_blocks()
+                    if unconfirmed[0].block_id not in self.block_meta:
+                        return  # still failed - stay in need_discovery, retry next eligible frame
+                self.last_discovery_success = time.monotonic()
+                self.state = "tracking"
+            finally:
+                self.discovering = False
+            return
+
         now = time.monotonic()
         if now - self.started_at < self.args.startup_delay:
             # This process is always started by pressing a QAM button, so
@@ -804,16 +859,21 @@ class DynamicCaptureRunner:
         finally:
             buffer.unmap(map_info)
 
-        if (self.args.qam_open_flag and self.args.qam_open_flag.exists()) or (
-            self.args.status_toast_flag and self.args.status_toast_flag.exists()
+        if (
+            (self.args.qam_open_flag and self.args.qam_open_flag.exists())
+            or (self.args.status_toast_flag and self.args.status_toast_flag.exists())
+            or (self.args.roi_editor_open_flag and self.args.roi_editor_open_flag.exists())
         ):
-            # Either the QAM sidebar is open (index.tsx polls Steam's own
+            # The QAM sidebar is open (index.tsx polls Steam's own
             # openSideMenu state and sets qam_open_flag live), or
             # PlayTranslate's own StatusToast corner notification (L4
-            # refresh/pause/resume feedback, ~2s) is currently on screen -
-            # see PHASE_A_HANDOFF.md's 2026-08-19 section for both. Either
-            # way this is PlayTranslate's own screen content, not the game,
-            # so skip everything the same way, including tap-to-translate:
+            # refresh/pause/resume feedback, ~2s) is currently on screen, or
+            # the single-region crop editor modal is open (RoiCrop.tsx's own
+            # mount/unmount - see --roi-editor-open-flag's help for why this
+            # can't just reuse qam_open_flag) - see PHASE_A_HANDOFF.md's
+            # 2026-08-19 section for the first two. Either way this is
+            # PlayTranslate's own screen content, not the game, so skip
+            # everything the same way, including tap-to-translate:
             # a touchscreen tap during either state lands on that UI, not
             # the game, so there's no valid tap coordinate to service. Still
             # pull/map/unmap every frame above to keep the GStreamer
@@ -867,12 +927,28 @@ class DynamicCaptureRunner:
                 self.block_meta.pop(block_id, None)
             if stale_ids:
                 self.log(f"[track] blocks went stale and were dropped: {stale_ids}")
-            if scene_changed:
+            if scene_changed and not self.args.fixed_roi:
                 # A directly-observed real transition - the old block set is
                 # confirmed wrong now, so this is the one case that still
                 # blanks the display immediately rather than waiting for a
                 # replacement (see maybe_discover()'s "don't touch on a
                 # miss" comment for why the other two triggers below don't).
+                #
+                # Skipped entirely in fixed-roi mode: the tracked region is
+                # user-picked, not discovered, so background motion outside
+                # it (a scene cut, camera pan, ambient animation - anything
+                # not touching the region itself) has no bearing on where to
+                # look next. Confirmed live: treating it the same as wide
+                # mode here made this an unconditional reset+reseed loop on
+                # any busy scene, and worse, that reseed path bypasses
+                # write_active_blocks()'s suppress() call (which normally
+                # protects a block's next diff pass from reading its own
+                # just-rendered overlay back as new content) - the fixed
+                # region's freshly re-armed baseline could sample mid-way
+                # through its own overlay repainting, and from there
+                # nothing ever broke the loop: reading the overlay back
+                # produced a "changed" reading, which updated the overlay,
+                # which the *next* reset then read back again.
                 self.log("[track] sustained background change -> dropping all blocks, re-discovering")
                 self.tracker.clear()
                 self.block_meta = {}
@@ -1005,6 +1081,15 @@ def main():
     )
     parser.add_argument("--discovery-min-interval", type=float, default=2.0, help="Seconds between discovery attempts.")
     parser.add_argument(
+        "--fixed-roi",
+        type=json.loads,
+        default=None,
+        help="JSON {x_pct,y_pct,width_pct,height_pct} of a single fixed region. When set, "
+        "full-frame /discover_blocks is skipped entirely and exactly this region is tracked - "
+        "the single-region-crop mode, using the same settle/re-OCR/translate pipeline as wide "
+        "discovery instead of legacy capture.py's own --diff mode.",
+    )
+    parser.add_argument(
         "--periodic-rediscover-interval",
         type=float,
         default=25.0,
@@ -1047,6 +1132,15 @@ def main():
         "(a tap now lands on the QAM UI, not the game). Created/removed by main.py's set_dynamic_qam_open(), driven by index.tsx polling Steam's own "
         "window.SteamUIStore...m_eOpenSideMenu - see PHASE_A_HANDOFF.md's 2026-08-19 QAM-cascade writeup for why this exists as a separate flag from "
         "--pause-flag rather than reusing it: a user-initiated pause and an automatic QAM-open suppression should not be able to clobber each other.",
+    )
+    parser.add_argument(
+        "--roi-editor-open-flag",
+        type=Path,
+        help="If this path exists, skip all discovery/tracking/translation work each frame, same as --qam-open-flag but driven by RoiCrop.tsx's own "
+        "mount/unmount instead of QAM-sidebar polling. A separate flag rather than reusing --qam-open-flag: opening that modal closes the QAM side "
+        "menu (Steam treats them as different UI layers), so index.tsx's QAM-open poll immediately overwrote --qam-open-flag back to 'closed' while "
+        "the modal (with its own on-screen text) was still very much up - confirmed live 2026-08-19. Created/removed by main.py's "
+        "set_dynamic_roi_editor_open().",
     )
     parser.add_argument(
         "--status-toast-flag",

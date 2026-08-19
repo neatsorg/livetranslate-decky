@@ -84,6 +84,11 @@ class Plugin:
         self.ocr_worker_log_file = None
         self.dynamic_process = None
         self.dynamic_log_file = None
+        # None = wide full-frame discovery; {x_pct,y_pct,width_pct,height_pct}
+        # = single fixed-region mode (see start_dynamic_capture_fixed_roi()).
+        # Remembered here so refresh_dynamic_capture()'s restart keeps
+        # whichever mode was actually running instead of reverting to wide.
+        self._dynamic_fixed_roi = None
         self.translate_server_process = None
         self.translate_server_log_file = None
         self.dynamic_refresh_lock = asyncio.Lock()
@@ -102,6 +107,16 @@ class Plugin:
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
         self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
         self.dynamic_qam_open_flag_path = self.data_dir / "dynamic_qam_open.flag"
+        # Deliberately separate from dynamic_qam_open_flag_path above, not
+        # reused - index.tsx's 300ms QAM-sidebar poll (see that useEffect)
+        # writes that flag independently based on Steam's own side-menu
+        # state, and opening RoiCrop.tsx's modal closes the side menu
+        # (Steam treats it as a different UI layer), so the poll clobbers a
+        # "true" this flag would otherwise hold back to "false" within one
+        # tick - confirmed live 2026-08-19, the modal's own on-screen text
+        # kept getting captured and translated despite RoiCrop marking
+        # itself open, because that poll immediately overwrote it.
+        self.dynamic_roi_editor_open_flag_path = self.data_dir / "dynamic_roi_editor_open.flag"
         self.dynamic_status_toast_flag_path = self.data_dir / "dynamic_status_toast.flag"
         self._status_toast_clear_task = None
         self.tap_request_path = self.data_dir / "tap_request.json"
@@ -823,6 +838,91 @@ class Plugin:
             # rather than blocking calibration entirely; the region
             # percentages just won't match runtime until this succeeds.
         return self._read_image_base64(image_path)
+
+    def _run_gamescope_screenshot(self, output_path, timeout_s=5.0):
+        """Captures gamescope's own composited base/game plane via its
+        debug console (`gamescopectl screenshot <path>`) - not PipeWire,
+        not CDP. Confirmed live (2026-08-19) to exclude the QAM sidebar
+        even while it's open, since QAM is a separate compositor plane
+        gamescope never bakes into this capture - unlike capture.py's
+        PipeWire feed, which shows whatever was actually scanned out.
+        Doesn't depend on the user pressing the Steam screenshot hotkey or
+        on Steam's userdata folder, unlike get_latest_steam_screenshot()
+        above. `gamescopectl` dispatches the command and returns before the
+        file necessarily exists, so poll briefly rather than trusting its
+        exit alone.
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            subprocess.run(
+                ["gamescopectl", "screenshot", str(output_path)],
+                timeout=10,
+                capture_output=True,
+                check=True,
+                env=self._capture_env(),
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return True
+            time.sleep(0.1)
+        return output_path.exists()
+
+    async def get_roi_crop_screenshot(self):
+        """Screenshot source for the single-rectangle crop UI - always a
+        fresh, QAM-free capture, no prior calibration roi involved (the
+        user is about to pick one)."""
+        output_path = self.data_dir / "captures" / "roi_crop_source.png"
+        ok = await asyncio.to_thread(self._run_gamescope_screenshot, output_path)
+        if not ok:
+            return {"ok": False, "error": "gamescopectl screenshot failed or timed out"}
+        return self._read_image_base64(output_path)
+
+    def _dynamic_roi_path(self, engine_dir, game_id):
+        return engine_dir / f"dynamic_roi.{game_id}.json"
+
+    def _valid_roi(self, roi):
+        return isinstance(roi, dict) and all(
+            isinstance(roi.get(key), (int, float)) for key in ("x_pct", "y_pct", "width_pct", "height_pct")
+        )
+
+    async def get_dynamic_roi(self, game_id=None):
+        game_id = str(game_id or "").strip() or self._get_active_game_id()
+        if not self._valid_game_id(game_id):
+            return {"ok": False, "error": "invalid game id", "roi": None}
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            return {"ok": False, "error": "engine directory was not found", "roi": None}
+        path = self._dynamic_roi_path(engine_dir, game_id)
+        if not path.exists():
+            return {"ok": True, "roi": None}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc), "roi": None}
+        return {"ok": True, "roi": data.get("roi")}
+
+    async def save_dynamic_roi(self, roi, game_id=None):
+        game_id = str(game_id or "").strip() or self._get_active_game_id()
+        if not self._valid_game_id(game_id):
+            return {"ok": False, "error": "invalid game id"}
+        if not self._valid_roi(roi):
+            return {"ok": False, "error": "roi must include numeric x_pct/y_pct/width_pct/height_pct"}
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            return {"ok": False, "error": "engine directory was not found"}
+        path = self._dynamic_roi_path(engine_dir, game_id)
+        try:
+            path.write_text(json.dumps({"roi": roi}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "roi": roi}
 
     async def test_ocr_region(self, region, image_path=None):
         if not isinstance(region, dict):
@@ -1618,13 +1718,23 @@ class Plugin:
         except ProcessLookupError:
             pass
 
-    async def start_dynamic_capture(self):
+    async def start_dynamic_capture(self, fixed_roi=None):
+        """fixed_roi: None for wide full-frame discovery (the default,
+        matching every existing caller), or {x_pct,y_pct,width_pct,
+        height_pct} to track only that single region instead (see
+        capture_dynamic.py's --fixed-roi). If the engine is already running
+        in the *other* mode, it's stopped and restarted in the requested
+        one rather than left as-is.
+        """
         engine_dir, script = self._find_dynamic_capture_script()
-        if self._is_dynamic_running():
+        if self._is_dynamic_running() and fixed_roi == self._dynamic_fixed_roi:
             if engine_dir:
                 asyncio.create_task(self._ensure_ocr_worker(engine_dir))
                 asyncio.create_task(self._ensure_translate_server_if_needed())
             return await self.dynamic_status()
+        if self._is_dynamic_running():
+            await self.stop_dynamic_capture()
+        self._dynamic_fixed_roi = fixed_roi
 
         if not script:
             return {
@@ -1701,6 +1811,8 @@ class Plugin:
             str(self.dynamic_pause_flag_path),
             "--qam-open-flag",
             str(self.dynamic_qam_open_flag_path),
+            "--roi-editor-open-flag",
+            str(self.dynamic_roi_editor_open_flag_path),
             "--status-toast-flag",
             str(self.dynamic_status_toast_flag_path),
             "--tap-request",
@@ -1712,6 +1824,8 @@ class Plugin:
             "--report-interval",
             "8",
         ]
+        if fixed_roi:
+            command += ["--fixed-roi", json.dumps(fixed_roi)]
 
         try:
             self.dynamic_process = subprocess.Popen(
@@ -1733,6 +1847,13 @@ class Plugin:
         asyncio.create_task(self._ensure_ocr_worker(engine_dir))
         asyncio.create_task(self._ensure_translate_server_if_needed())
         return await self.dynamic_status()
+
+    async def start_dynamic_capture_fixed_roi(self, roi):
+        """QAM/crop-UI entry point for single-region dynamic mode - see
+        start_dynamic_capture()'s fixed_roi param."""
+        if not self._valid_roi(roi):
+            return {"running": False, "error": "roi must include numeric x_pct/y_pct/width_pct/height_pct"}
+        return await self.start_dynamic_capture(fixed_roi=dict(roi))
 
     async def stop_dynamic_capture(self):
         await self._kill_tracked_dynamic_process()
@@ -1789,17 +1910,16 @@ class Plugin:
         Also pre-arms dynamic_status_toast_flag_path itself, synchronously,
         right after the new process spawns - found live 2026-08-19 that
         relying solely on index.tsx's showToast()->set_dynamic_status_
-        toast_visible() round trip (see that method) was too slow: with
-        --startup-delay now 0, the new process's first discovery can finish
-        before that RPC round trip (itself following the *entire* refresh
-        RPC this method just ran) ever lands, so "PlayTranslate: refreshed"
-        was still getting OCR'd and translated most times. Setting it here
-        instead closes the gap to a few lines of synchronous Python.
-        Self-clearing (not left for the frontend's showToast() to clear
-        alone) because this method is also called from the QAM's "Refresh
-        Dynamic Capture" button, which never calls showToast() at all - if
-        only the frontend cleared it, a QAM-triggered refresh would leave
-        capture permanently suppressed.
+        toast_visible() round trip was too slow: with --startup-delay now
+        0, the new process's first discovery can finish before that round
+        trip (itself following this entire refresh RPC) ever lands, so
+        "PlayTranslate: refreshed" was still getting OCR'd and translated
+        most times. Deliberately only done here, not inside
+        start_dynamic_capture() itself - a plain fresh Start (wide or
+        region) has no toast to protect against and doesn't need the extra
+        ~2.5s of blanket suppression this adds; region mode's own crop-
+        editor-open race is covered separately by dynamic_roi_editor_open_
+        flag_path instead, which isn't time-boxed at all.
         """
         async with self.dynamic_refresh_lock:
             try:
@@ -1807,20 +1927,31 @@ class Plugin:
             except FileNotFoundError:
                 pass
             await self.stop_dynamic_capture()
-            result = await self.start_dynamic_capture()
+            result = await self.start_dynamic_capture(fixed_roi=self._dynamic_fixed_roi)
             asyncio.create_task(asyncio.to_thread(self._clear_translation_cache))
-            self.dynamic_status_toast_flag_path.touch()
-            # Cancel any still-pending clear from an earlier refresh before
-            # scheduling this one's - without this, rapid repeated Refresh
-            # presses (mashing the QAM button, or L4) could let an older
-            # call's timer clear the flag while a newer refresh's process
-            # is still supposed to be protected by it.
-            if self._status_toast_clear_task is not None:
-                self._status_toast_clear_task.cancel()
-            self._status_toast_clear_task = asyncio.create_task(
-                self._clear_status_toast_flag_after(_STATUS_TOAST_SUPPRESS_S)
-            )
+            self._arm_status_toast_suppression()
             return result
+
+    def _arm_status_toast_suppression(self):
+        """Pre-arms dynamic_status_toast_flag_path synchronously, right
+        after a process spawns - see refresh_dynamic_capture()'s docstring
+        for why this can't wait on a frontend round trip. Shared by every
+        (re)start path, not just refresh: confirmed live 2026-08-19 that
+        Region mode's "Save & Start"/"Start Region Mode" buttons hit the
+        exact same self-capture window (that time reading the crop
+        modal's/QAM's own on-screen text instead of a toast), just via a
+        different piece of PlayTranslate's own UI.
+        """
+        self.dynamic_status_toast_flag_path.touch()
+        # Cancel any still-pending clear from an earlier (re)start before
+        # scheduling this one's - without this, rapid repeated presses
+        # could let an older call's timer clear the flag while a newer
+        # start's process is still supposed to be protected by it.
+        if self._status_toast_clear_task is not None:
+            self._status_toast_clear_task.cancel()
+        self._status_toast_clear_task = asyncio.create_task(
+            self._clear_status_toast_flag_after(_STATUS_TOAST_SUPPRESS_S)
+        )
 
     async def _clear_status_toast_flag_after(self, delay_s):
         await asyncio.sleep(delay_s)
@@ -1921,6 +2052,31 @@ class Plugin:
             except FileNotFoundError:
                 pass
         return {"qam_open": is_open}
+
+    async def set_dynamic_roi_editor_open(self, is_open: bool):
+        """Driven by RoiCrop.tsx's own mount/unmount, not by QAM visibility -
+        deliberately a separate flag from dynamic_qam_open_flag_path above,
+        not a reuse of it. Confirmed live 2026-08-19: reusing that flag
+        didn't work, because opening this modal closes the QAM side menu
+        (Steam treats them as different UI layers), and index.tsx's 300ms
+        QAM-poll then immediately overwrote "open" back to "false" - two
+        independent signals racing on one flag, with the poll winning.
+        Also, unlike set_dynamic_qam_open(), no "only touch if something's
+        running" guard: this must still register truthfully even when the
+        modal opens before any engine exists yet (the common "Configure
+        Region... then Save & Start" order), so a process spawned while
+        the modal is still up is protected from its very first frame -
+        capture_dynamic.py reads this file at startup like any other flag,
+        no live "is it running" check needed on this side.
+        """
+        if is_open:
+            self.dynamic_roi_editor_open_flag_path.touch()
+        else:
+            try:
+                self.dynamic_roi_editor_open_flag_path.unlink()
+            except FileNotFoundError:
+                pass
+        return {"roi_editor_open": is_open}
 
     async def set_dynamic_status_toast_visible(self, is_visible: bool):
         """Called directly by index.tsx's showToast() around dispatching the

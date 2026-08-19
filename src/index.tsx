@@ -14,6 +14,7 @@ import { FaLanguage } from "react-icons/fa";
 import { CompositionRequest, UIComposition } from "./Composition";
 import { openRegionCalibration } from "./Calibration";
 import { openKeybindings } from "./Keybindings";
+import { openRoiCropEditor } from "./RoiCrop";
 
 type CaptureStatus = {
   running: boolean;
@@ -174,6 +175,10 @@ const setDynamicStatusToastVisible = callable<[boolean], { status_toast_visible:
 );
 const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
 const requestTapTranslate = callable<[number, number], TapResult>("request_tap_translate");
+const getDynamicRoi = callable<[], { ok: boolean; roi?: RoiPct | null; error?: string }>("get_dynamic_roi");
+const startDynamicCaptureFixedRoi = callable<[RoiPct], DynamicStatus>("start_dynamic_capture_fixed_roi");
+
+type RoiPct = { x_pct: number; y_pct: number; width_pct: number; height_pct: number };
 
 type BindingCommand = "refresh" | "pause_resume" | "touch_translate";
 
@@ -1212,6 +1217,7 @@ function PositionedOverlay() {
 function Content() {
   const [status, setStatus] = useState<CaptureStatus | undefined>();
   const [dynamicStatus, setDynamicStatus] = useState<DynamicStatus | undefined>();
+  const [regionModeStatus, setRegionModeStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [inputTest, setInputTest] = useState<string>("not tested");
   const [aiStatus, setAiStatus] = useState<string>("not checked");
@@ -1624,6 +1630,65 @@ function Content() {
           {dynamicStatus?.error ?? dynamicStatus?.log_tail ?? ""}
         </pre>
       </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="PlayTranslate — Dynamic (Region)">
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          Same engine as above, restricted to one hand-picked rectangle (e.g.
+          the subtitle box) instead of scanning the whole screen. Uses the
+          same process, so "Stop Dynamic Capture" above stops this too.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy}
+          layout="below"
+          onClick={() => {
+            tryCloseQuickAccessMenu();
+            openRoiCropEditor();
+          }}
+        >
+          Configure Region…
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          disabled={busy}
+          layout="below"
+          onClick={async () => {
+            setBusy(true);
+            setRegionModeStatus("");
+            try {
+              const saved = await getDynamicRoi();
+              if (!saved.ok || !saved.roi) {
+                setRegionModeStatus(saved.error || "no region configured yet - use Configure Region first");
+                return;
+              }
+              // Fired before the start RPC, not after (matching the wide
+              // "Start Dynamic Capture" button above) - closing the QAM
+              // only after the new process is already capturing left its
+              // own on-screen text as fair game for the engine's first
+              // (self-confirming, non-retried) read. start_dynamic_capture()
+              // also self-stops+restarts when the requested mode differs
+              // from whatever's currently running, which is what lets this
+              // button stay enabled at all times instead of no-oping.
+              tryCloseQuickAccessMenu();
+              const next = await startDynamicCaptureFixedRoi(saved.roi);
+              setDynamicStatus(next);
+              setRegionModeStatus(next.error || "");
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          Start Region Mode
+        </ButtonItem>
+      </PanelSectionRow>
+      {regionModeStatus && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", color: "#ff8a80" }}>{regionModeStatus}</div>
+        </PanelSectionRow>
+      )}
     </PanelSection>
     </>
   );
