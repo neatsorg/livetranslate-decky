@@ -76,13 +76,12 @@ function preventFormSubmit(handler: () => void) {
 // Deliberately just four sliders over a screenshot, not a draggable/
 // resizable editor - this mode only ever tracks one fixed region, so
 // there's nothing to name, add, or remove.
-function RoiCropContent({ onClose }: { onClose: () => void }) {
+function RoiCropContent({ onClose, modalToken }: { onClose: () => void; modalToken: string }) {
   const [imageData, setImageData] = useState<string>("");
   const [loadError, setLoadError] = useState<string>("");
   const [roi, setRoi] = useState<Roi>(DEFAULT_ROI);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>("");
-  const [modalToken] = useState(createToken);
 
   const loadScreenshot = useCallback(async () => {
     setLoadError("");
@@ -265,11 +264,24 @@ function RoiCropContent({ onClose }: { onClose: () => void }) {
   );
 }
 
-export function openRoiCropEditor() {
+export async function openRoiCropEditor() {
+  // Awaited here, before the modal ever mounts, rather than left to
+  // RoiCropContent's own mount effect - confirmed live 2026-08-20 (via the
+  // identical race on Keybindings.tsx, whose more visually-active screen
+  // made it far more likely to lose) that "mount -> useEffect -> RPC round
+  // trip" can lose the race against capture_dynamic.py's per-frame flag
+  // check: Steam repaints this modal's content before the effect's RPC call
+  // lands, and a background-change-triggered re-discovery in that window
+  // reads the modal's own on-screen text as if it were game content. This
+  // screen's mostly-static screenshot made that race far less likely to be
+  // lost than Keybindings', not immune to it.
+  const modalToken = createToken();
+  await setDynamicRoiEditorOpen(true, modalToken).catch(() => {});
+
   let close = () => {};
   const modal = showModal(
     <ModalRoot bAllowFullSize onCancel={() => close()} closeModal={() => close()}>
-      <RoiCropContent onClose={() => close()} />
+      <RoiCropContent onClose={() => close()} modalToken={modalToken} />
     </ModalRoot>,
     window
   );

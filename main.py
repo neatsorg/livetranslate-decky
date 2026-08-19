@@ -92,6 +92,9 @@ class Plugin:
         self._dynamic_fixed_roi = None
         self.translate_server_process = None
         self.translate_server_log_file = None
+        self.ocr_setup_process = None
+        self.ocr_setup_log_file = None
+        self.ocr_setup_last_returncode = None
         self.dynamic_refresh_lock = asyncio.Lock()
         self.plugin_dir = Path(__file__).resolve().parent
         self.data_dir = Path(getattr(decky, "DECKY_PLUGIN_DIR", self.plugin_dir)).parent.parent / "data" / "PlayTranslate"
@@ -125,16 +128,21 @@ class Plugin:
         self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
         self.keybinding_settings_path = self.data_dir / "keybindings.json"
         self.hidraw_path = None
+        self.ocr_setup_log_path = self.data_dir / "ocr-setup.log"
 
     async def _main(self):
         decky.logger.info("PlayTranslate loaded")
 
     async def _unload(self):
-        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server())
+        await asyncio.gather(
+            self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server(), self._stop_ocr_setup()
+        )
         decky.logger.info("PlayTranslate unloaded")
 
     async def _uninstall(self):
-        await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server())
+        await asyncio.gather(
+            self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server(), self._stop_ocr_setup()
+        )
 
     def _candidate_engine_dirs(self):
         # bin/ inside this plugin is the only shipped location - the engine
@@ -230,7 +238,13 @@ class Plugin:
         env = os.environ.copy()
         env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
         env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
-        env["PATH"] = "/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
+        # ~/.local/bin first: distrobox/podman install there when a Deck
+        # doesn't have them from the OS (see setup_ocr_container.sh and
+        # provision_ocr_container() below) - without this, every distrobox
+        # call this plugin makes (_distrobox_python_command included) can
+        # only find them if something else already put that dir on PATH.
+        local_bin = str(Path.home() / ".local" / "bin")
+        env["PATH"] = f"{local_bin}:/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
         return env
 
     def _subprocess_env(self):
@@ -613,11 +627,14 @@ class Plugin:
 
         return await asyncio.to_thread(check)
 
+    def _ocr_container_name(self):
+        return os.environ.get("PLAYTRANSLATE_OCR_BOX", "playtranslate-ocr")
+
     def _distrobox_python_command(self, script, *args):
         return [
             "distrobox",
             "enter",
-            os.environ.get("PLAYTRANSLATE_OCR_BOX", "playtranslate-ocr"),
+            self._ocr_container_name(),
             "--",
             "python3",
             str(script),
@@ -1113,6 +1130,158 @@ class Plugin:
 
         if worker_py:
             await self._stop_processes_by_script(worker_py, "ocr_worker")
+
+    def _which_in_env(self, name, env):
+        for directory in env.get("PATH", "").split(os.pathsep):
+            if not directory:
+                continue
+            candidate = Path(directory) / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return None
+
+    def _distrobox_container_names(self, distrobox_bin, env):
+        """Parses `distrobox list`'s pipe-separated table (ID | NAME | STATUS
+        | IMAGE) for existing container names. Returns None on any failure
+        (distrobox not usable yet) so callers can distinguish that from "no
+        containers exist" (an empty list)."""
+        try:
+            result = subprocess.run(
+                [distrobox_bin, "list", "--no-color"],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        names = []
+        for line in result.stdout.splitlines()[1:]:
+            parts = line.split("|")
+            if len(parts) >= 2:
+                names.append(parts[1].strip())
+        return names
+
+    def _is_ocr_setup_running(self):
+        if self.ocr_setup_process is None:
+            return False
+        if self.ocr_setup_process.poll() is None:
+            return True
+        # Finished since the last check - close out the log and clear state
+        # so the next status poll reports "not running" with a final result
+        # instead of re-detecting the same exit every tick.
+        self.ocr_setup_last_returncode = self.ocr_setup_process.returncode
+        if self.ocr_setup_log_file:
+            self.ocr_setup_log_file.write(
+                f"--- PlayTranslate OCR container setup exited with code "
+                f"{self.ocr_setup_last_returncode} {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+            )
+            self.ocr_setup_log_file.close()
+            self.ocr_setup_log_file = None
+        self.ocr_setup_process = None
+        return False
+
+    def _tail_ocr_setup_log(self, lines=80):
+        if not self.ocr_setup_log_path.exists():
+            return ""
+        try:
+            text = self.ocr_setup_log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"Could not read log: {exc}"
+        return "\n".join(text.splitlines()[-lines:])
+
+    async def get_ocr_container_status(self):
+        """Reports whether the distrobox container ocr_worker.py always runs
+        inside (see _distrobox_python_command) is ready - required for every
+        OCR engine, including the default Chrome Screen AI, not just the
+        Tesseract fallback. Safe to poll continuously from the QAM OCR tab;
+        every check here is read-only."""
+        env = self._subprocess_env()
+        running = self._is_ocr_setup_running()
+
+        def check():
+            distrobox_bin = self._which_in_env("distrobox", env)
+            podman_bin = self._which_in_env("podman", env)
+            names = self._distrobox_container_names(distrobox_bin, env) if distrobox_bin else None
+            return distrobox_bin, podman_bin, names
+
+        distrobox_bin, podman_bin, names = await asyncio.to_thread(check)
+        container_name = self._ocr_container_name()
+        container_exists = names is not None and container_name in names
+        return {
+            "distrobox_installed": distrobox_bin is not None,
+            "podman_installed": podman_bin is not None,
+            "container_name": container_name,
+            "container_exists": container_exists,
+            "running": running,
+            "ready": distrobox_bin is not None and container_exists,
+            "last_exit_code": self.ocr_setup_last_returncode,
+            "log_tail": self._tail_ocr_setup_log(),
+        }
+
+    async def provision_ocr_container(self):
+        """Kicks off bin/setup_ocr_container.sh in the background: installs
+        distrobox+podman to ~/.local if missing, creates the OCR container if
+        missing, and (re)installs its Python deps either way. Idempotent, so
+        the QAM button can just be pressed again after a failure. Returns
+        immediately - poll get_ocr_container_status() for progress via its
+        log_tail/running fields."""
+        if self._is_ocr_setup_running():
+            return {"ok": True, "already_running": True}
+
+        engine_dir, _capture_py, _config_json = self._find_engine()
+        if not engine_dir:
+            return {"ok": False, "error": "PlayTranslate engine directory was not found"}
+        script = engine_dir / "setup_ocr_container.sh"
+        if not script.exists():
+            return {"ok": False, "error": f"{script} was not found"}
+
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        log_file = self.ocr_setup_log_path.open("a", encoding="utf-8")
+        log_file.write(f"\n--- PlayTranslate OCR container setup start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        log_file.flush()
+
+        env = self._subprocess_env()
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            self.ocr_setup_process = subprocess.Popen(
+                ["bash", str(script)],
+                cwd=str(engine_dir),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log_file.write(f"Failed to start setup script: {exc}\n")
+            log_file.flush()
+            log_file.close()
+            return {"ok": False, "error": str(exc)}
+
+        self.ocr_setup_last_returncode = None
+        self.ocr_setup_log_file = log_file
+        decky.logger.info(f"PlayTranslate OCR container setup started pid={self.ocr_setup_process.pid}")
+        return {"ok": True, "started": True}
+
+    async def _stop_ocr_setup(self):
+        if self.ocr_setup_process is not None:
+            pid = self.ocr_setup_process.pid
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                for _ in range(20):
+                    if self.ocr_setup_process.poll() is not None:
+                        break
+                    await asyncio.sleep(0.1)
+                if self.ocr_setup_process.poll() is None:
+                    os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.ocr_setup_process = None
+
+        if self.ocr_setup_log_file:
+            self.ocr_setup_log_file.write(f"--- PlayTranslate OCR container setup stop {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            self.ocr_setup_log_file.close()
+            self.ocr_setup_log_file = None
 
     def _translate_server_port(self):
         return int(os.environ.get("PLAYTRANSLATE_TRANSLATE_SERVER_PORT", "8790"))
@@ -2104,39 +2273,59 @@ class Plugin:
             return False
         try:
             self.dynamic_roi_editor_open_flag_path.unlink()
+            decky.logger.info(
+                f"_clear_stale_roi_editor_flag: cleared stale flag (token={data.get('token')}, "
+                f"opened_at={data.get('opened_at')})"
+            )
             return True
         except FileNotFoundError:
             return False
 
     async def set_dynamic_roi_editor_open(self, is_open: bool, token=None):
-        """Driven by RoiCrop.tsx's own mount/unmount, not by QAM visibility -
-        deliberately a separate flag from dynamic_qam_open_flag_path above,
-        not a reuse of it. Confirmed live 2026-08-19: reusing that flag
-        didn't work, because opening this modal closes the QAM side menu
-        (Steam treats them as different UI layers), and index.tsx's 300ms
-        QAM-poll then immediately overwrote "open" back to "false" - two
-        independent signals racing on one flag, with the poll winning.
+        """Driven by RoiCrop.tsx's and Keybindings.tsx's own mount/unmount,
+        not by QAM visibility - deliberately a separate flag from
+        dynamic_qam_open_flag_path above, not a reuse of it. Confirmed live
+        2026-08-19: reusing that flag didn't work, because opening either
+        modal closes the QAM side menu (Steam treats them as different UI
+        layers), and index.tsx's 300ms QAM-poll then immediately overwrote
+        "open" back to "false" - two independent signals racing on one
+        flag, with the poll winning. Both modals share this one flag/RPC
+        rather than each getting their own: they're the same class of
+        problem (PlayTranslate's own on-screen UI needing "don't read my
+        own text" protection), and sharing means Keybindings.tsx gets
+        set_dynamic_qam_open()'s existing stale-flag recovery
+        (_clear_stale_roi_editor_flag, run on every QAM reopen) for free
+        instead of needing a second copy of that exception path. The name
+        stays ROI-specific for now since RoiCrop.tsx was first - token-based
+        ownership (below) is what actually makes sharing safe, not the name.
         Also, unlike set_dynamic_qam_open(), no "only touch if something's
-        running" guard: this must still register truthfully even when the
+        running" guard: this must still register truthfully even when a
         modal opens before any engine exists yet (the common "Configure
-        Region... then Save & Start" order), so a process spawned while
-        the modal is still up is protected from its very first frame -
+        Region... then Save & Start" order), so a process spawned while a
+        modal is still up is protected from its very first frame -
         capture_dynamic.py reads this file at startup like any other flag,
         no live "is it running" check needed on this side.
         """
         token = str(token or "").strip()
         if not token:
+            decky.logger.warning("set_dynamic_roi_editor_open: called with no token, ignoring")
             return {"roi_editor_open": self.dynamic_roi_editor_open_flag_path.exists(), "error": "token is required"}
         if is_open:
             payload = {"token": token, "opened_at": time.time()}
             self.dynamic_roi_editor_open_flag_path.parent.mkdir(parents=True, exist_ok=True)
             self.dynamic_roi_editor_open_flag_path.write_text(json.dumps(payload), encoding="utf-8")
+            decky.logger.info(f"set_dynamic_roi_editor_open: armed (token={token})")
         else:
             current = self._read_roi_editor_flag()
             if current and current.get("token") != token:
+                decky.logger.info(
+                    f"set_dynamic_roi_editor_open: ignoring release from token={token}, "
+                    f"currently held by token={current.get('token')}"
+                )
                 return {"roi_editor_open": self.dynamic_roi_editor_open_flag_path.exists()}
             try:
                 self.dynamic_roi_editor_open_flag_path.unlink()
+                decky.logger.info(f"set_dynamic_roi_editor_open: released (token={token})")
             except FileNotFoundError:
                 pass
         return {"roi_editor_open": is_open}

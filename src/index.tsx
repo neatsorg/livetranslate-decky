@@ -83,12 +83,28 @@ type ScreenAIStatus = {
   error?: string | null;
 };
 
+type OcrContainerStatus = {
+  distrobox_installed: boolean;
+  podman_installed: boolean;
+  container_name: string;
+  container_exists: boolean;
+  running: boolean;
+  ready: boolean;
+  last_exit_code?: number | null;
+  log_tail: string;
+};
+
 const getOcrSettings = callable<[], OcrSettings>("get_ocr_settings");
 const setOcrSettings = callable<[Partial<OcrSettings>], OcrSettings>("set_ocr_settings");
 const getScreenaiStatus = callable<[], ScreenAIStatus>("get_screenai_status");
 const downloadScreenai = callable<[], { ok: boolean; error?: string }>("download_screenai");
 const cancelScreenaiDownload = callable<[], { ok: boolean }>("cancel_screenai_download");
 const deleteScreenai = callable<[], { ok: boolean; error?: string }>("delete_screenai");
+const getOcrContainerStatus = callable<[], OcrContainerStatus>("get_ocr_container_status");
+const provisionOcrContainer = callable<
+  [],
+  { ok: boolean; error?: string; already_running?: boolean; started?: boolean }
+>("provision_ocr_container");
 
 const LANGUAGE_OPTIONS = [
   { data: "English", label: "English" },
@@ -1263,6 +1279,31 @@ function Content() {
     };
   }, []);
 
+  const [ocrContainerStatus, setOcrContainerStatus] = useState<OcrContainerStatus | undefined>();
+  const [showOcrSetupLog, setShowOcrSetupLog] = useState(false);
+
+  // Same "just keep polling" approach as screenaiStatus above - the OCR
+  // worker's distrobox container is a prerequisite for every OCR engine
+  // (not just Tesseract), so its readiness is worth surfacing any time the
+  // OCR tab is open, not only during an active setup run.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const next = await getOcrContainerStatus();
+        if (!cancelled) setOcrContainerStatus(next);
+      } catch {
+        // transient RPC hiccup - keep the last known status, try again next tick
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const applyTranslationSettings = async (patch: Partial<TranslationSettings>) => {
     const next = await setTranslationSettings(patch);
     setTranslationSettingsState(next);
@@ -1395,7 +1436,25 @@ function Content() {
     </PanelSection>
     <PanelSection title="Other Settings">
       <PanelSectionRow>
-        <ButtonItem disabled={busy} layout="below" onClick={() => openKeybindings()}>
+        <ButtonItem
+          disabled={busy}
+          layout="below"
+          onClick={() => {
+            // Closing QAM first (same as Region Mode Config below) matters
+            // beyond cosmetics: without it, dismissing this modal via B
+            // instead of its own Close button falls back to Steam's
+            // gamepad-nav stack showing the QAM side menu again (it's still
+            // the "parent" screen) instead of the game - confirmed live
+            // 2026-08-20, that window opened a gap where neither
+            // dynamic_qam_open_flag_path nor dynamic_roi_editor_open_flag_
+            // path was reliably set in time, so Dynamic Capture read QAM's
+            // own on-screen content as if it were game text. Region Mode
+            // Config never hit this because it already closed QAM first,
+            // so there's never a QAM to fall back to.
+            tryCloseQuickAccessMenu();
+            openKeybindings();
+          }}
+        >
           Key Bindings
         </ButtonItem>
       </PanelSectionRow>
@@ -1549,6 +1608,78 @@ function Content() {
 
   const ocrTabContent = (
     <>
+    <PanelSection title="OCR Environment">
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          The OCR worker runs inside a distrobox container named "
+          {ocrContainerStatus?.container_name ?? "playtranslate-ocr"}" - required for every OCR
+          engine, including Chrome Screen AI below.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.8 }}>
+          distrobox: {ocrContainerStatus?.distrobox_installed ? "installed" : "not installed"} · container:{" "}
+          {ocrContainerStatus?.container_exists ? "created" : "not created"}
+        </div>
+      </PanelSectionRow>
+      {ocrContainerStatus?.running && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.8 }}>
+            Setting up… this installs distrobox/podman and the container on first run, which can
+            take a few minutes.
+          </div>
+        </PanelSectionRow>
+      )}
+      {!ocrContainerStatus?.running && ocrContainerStatus?.last_exit_code != null && ocrContainerStatus.last_exit_code !== 0 && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", color: "#ff6b6b" }}>
+            Setup exited with code {ocrContainerStatus.last_exit_code} - see the log below.
+          </div>
+        </PanelSectionRow>
+      )}
+      <PanelSectionRow>
+        {!ocrContainerStatus?.running && (
+          <ButtonItem
+            layout="below"
+            onClick={async () => {
+              await provisionOcrContainer();
+              setOcrContainerStatus(await getOcrContainerStatus());
+            }}
+          >
+            {ocrContainerStatus?.ready ? "Re-run OCR Environment Setup" : "Set Up OCR Environment"}
+          </ButtonItem>
+        )}
+      </PanelSectionRow>
+      {ocrContainerStatus?.log_tail && (
+        <>
+          <PanelSectionRow>
+            {/* Steam's QAM overlay doesn't reliably deliver the click/focus
+              events a plain <details>/<summary> needs to toggle (confirmed
+              live: tapping it did nothing) - an explicit ButtonItem-driven
+              state toggle uses the same input path every other button in
+              this panel already relies on. */}
+            <ButtonItem layout="below" onClick={() => setShowOcrSetupLog((prev) => !prev)}>
+              {showOcrSetupLog ? "Hide Setup Log" : "Show Setup Log"}
+            </ButtonItem>
+          </PanelSectionRow>
+          {showOcrSetupLog && (
+            <PanelSectionRow>
+              <pre
+                style={{
+                  fontSize: "10px",
+                  whiteSpace: "pre-wrap",
+                  maxHeight: "160px",
+                  overflowY: "auto",
+                  margin: "4px 0 0",
+                }}
+              >
+                {ocrContainerStatus.log_tail}
+              </pre>
+            </PanelSectionRow>
+          )}
+        </>
+      )}
+    </PanelSection>
     <PanelSection title="OCR Engine">
       <PanelSectionRow>
         <div style={{ fontSize: "11px", opacity: 0.8, marginBottom: "4px" }}>

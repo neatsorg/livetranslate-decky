@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import ssl
 import threading
 import zipfile
 from typing import Dict, Optional
@@ -29,6 +30,32 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 logger = logging.getLogger(__name__)
+
+# Falls back through common Linux system CA bundle locations rather than
+# trusting Python's implicit default-path lookup - confirmed necessary on a
+# real Decky Loader deployment (aegis, 2026-08-19): the plugin backend
+# process (spawned by Decky's privileged parent, not an interactive shell)
+# hit "unable to get local issuer certificate" even though the exact same
+# interpreter run directly on the same machine, and the CA bundle file
+# itself, verified fine. OpenSSL's implicit default-path lookup honors the
+# SSL_CERT_FILE/SSL_CERT_DIR env vars and fails closed if either is set but
+# invalid in that process's environment; explicitly loading a known-good
+# bundle file sidesteps that regardless of what set it.
+_CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu/Arch
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora/RHEL/CentOS
+    "/etc/ssl/cert.pem",  # Alpine and others
+)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    for path in _CA_BUNDLE_CANDIDATES:
+        if os.path.isfile(path):
+            return ssl.create_default_context(cafile=path)
+    return ssl.create_default_context()
+
+
+_SSL_CONTEXT = _ssl_context()
 
 # CIPD's Linux build of this package is x86_64-only, which covers both the
 # Steam Deck (Zen2) and the dev/aegis boxes this project runs on.
@@ -160,7 +187,7 @@ class ScreenAIDownloader:
             method="POST",
         )
         try:
-            with urlrequest.urlopen(req, timeout=30) as resp:
+            with urlrequest.urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:
                 body = resp.read()
         except urlerror.HTTPError as exc:
             raise RuntimeError(f"CIPD pRPC HTTP {exc.code}: {exc.read()[:200]}") from exc
@@ -201,7 +228,7 @@ class ScreenAIDownloader:
                 raise RuntimeError("Download cancelled")
 
             try:
-                resp = urlrequest.urlopen(signed_url, timeout=60)
+                resp = urlrequest.urlopen(signed_url, timeout=60, context=_SSL_CONTEXT)
             except urlerror.HTTPError as exc:
                 raise RuntimeError(f"HTTP {exc.code} fetching Chrome Screen AI package") from exc
             except urlerror.URLError as exc:

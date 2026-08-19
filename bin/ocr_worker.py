@@ -525,20 +525,37 @@ class Worker:
         self.translate = load_module(translate_script, "playtranslate_worker_translate")
 
         self.tesseract_path = None
+        self.tesseract_init_error = None
         try:
             self.tesseract_path = self.ocr.require_command("tesseract")
-        except RuntimeError:
-            if tesserocr is None:
-                raise
+        except RuntimeError as exc:
+            self.tesseract_init_error = str(exc)
 
         tessdata_path = find_tessdata_prefix() if tesserocr is not None else None
         if tesserocr is not None and tessdata_path:
             self.engine = TesserocrEngine(tessdata_path)
             self.discovery_engine = DiscoveryEngine(tessdata_path)
-        else:
+        elif self.tesseract_path is not None:
             if tesserocr is not None:
                 print(f"tesserocr installed but no tessdata dir found; using CLI fallback", file=sys.stderr, flush=True)
             self.engine = CliEngine(self.ocr, self.tesseract_path)
+            self.discovery_engine = None
+        else:
+            # Neither tesserocr+tessdata nor the tesseract CLI is available.
+            # Not fatal by itself: Dynamic Capture's chromescreenai engine
+            # (the default) never touches self.engine/self.discovery_engine
+            # (see discover_blocks() below) - only the legacy fixed-region
+            # path (_ocr_region/test_region/translate_image) needs one.
+            # Confirmed live: this used to raise here unconditionally,
+            # which killed the whole worker - including chromescreenai
+            # discovery - on any box without Tesseract installed, even
+            # though chromescreenai doesn't need it at all.
+            print(
+                f"tesseract unavailable ({self.tesseract_init_error}) - legacy fixed-region OCR "
+                "will error until it's installed; chromescreenai discovery is unaffected",
+                file=sys.stderr, flush=True,
+            )
+            self.engine = None
             self.discovery_engine = None
 
         self.ocr_engine_name = ocr_engine
@@ -553,7 +570,7 @@ class Worker:
 
     @property
     def engine_name(self):
-        return self.engine.name
+        return self.engine.name if self.engine is not None else None
 
     def _load_regions(self, regions_json):
         path = Path(regions_json)
@@ -569,6 +586,8 @@ class Worker:
         name = region.get("name") or f"region_{index}"
         role = region.get("role", "text")
         try:
+            if self.engine is None:
+                raise RuntimeError(f"tesseract is not available: {self.tesseract_init_error}")
             prepared = self.ocr.prepare_image(image_path, region, f"{index}_{name}")
             raw_text = self.ocr.normalize_text(
                 self.engine.run(

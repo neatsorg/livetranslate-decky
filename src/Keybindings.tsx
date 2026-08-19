@@ -66,6 +66,22 @@ const COMMAND_META: Record<BindingCommand, { label: string; supportsLongPress: b
 
 const getKeybindingSettings = callable<[], KeybindingSettings>("get_keybinding_settings");
 const setKeybindingSettingsCall = callable<[KeybindingSettings], SetKeybindingsResult>("set_keybinding_settings");
+// Reuses RoiCrop.tsx's flag/RPC rather than a dedicated one - this modal is
+// just as much PlayTranslate's own on-screen UI as the region-crop editor
+// (same "don't read my own text" self-capture problem), and sharing the
+// flag means it also gets set_dynamic_qam_open()'s existing stale-flag
+// recovery (main.py's _clear_stale_roi_editor_flag, run on every QAM
+// reopen) for free, instead of needing a second copy of that exception path.
+const setDynamicRoiEditorOpen = callable<[boolean, string], { roi_editor_open: boolean }>(
+  "set_dynamic_roi_editor_open"
+);
+
+function createToken(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `keybindings_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 
 let nextBindingSeq = 1;
 function newBindingId(): string {
@@ -94,10 +110,29 @@ function defaultKeyFor(existingKeys: string[]): string {
   return BINDABLE_KEYS.find((key) => !existingKeys.includes(key)) ?? BINDABLE_KEYS[0];
 }
 
-function KeybindingsContent({ onClose }: { onClose: () => void }) {
+function KeybindingsContent({ onClose, modalToken }: { onClose: () => void; modalToken: string }) {
   const [bindings, setBindings] = useState<BindingDraft[]>([]);
   const [status, setStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
+
+  // This modal is just as much PlayTranslate's own on-screen UI as the
+  // region-crop editor, and an already-running Dynamic Capture needs the
+  // same "don't read my own text" protection while it's up - see
+  // setDynamicRoiEditorOpen's own comment above for why the flag is shared.
+  // openKeybindings() below already awaits arming this before the modal
+  // ever mounts - this effect's own arm call is just a redundant safety
+  // net (same token, idempotent), the unmount cleanup is what it's really
+  // here for. See openRoiCropEditor's comment for why the pre-open await
+  // is the one that actually matters: confirmed live 2026-08-20 that this
+  // mount effect alone was too slow to win the race against
+  // capture_dynamic.py's per-frame flag check, so it read this modal's own
+  // content as if it were game text.
+  useEffect(() => {
+    setDynamicRoiEditorOpen(true, modalToken).catch(() => {});
+    return () => {
+      setDynamicRoiEditorOpen(false, modalToken).catch(() => {});
+    };
+  }, [modalToken]);
 
   useEffect(() => {
     (async () => {
@@ -321,11 +356,17 @@ function KeybindingsContent({ onClose }: { onClose: () => void }) {
 // Uses showModal + ModalRoot rather than a plain div in the QAM panel
 // (gamepad focus-nav, dropdown portaling, and QAM's own right-third-of-
 // screen clipping) - same reasoning as RoiCrop.tsx's openRoiCropEditor.
-export function openKeybindings() {
+export async function openKeybindings() {
+  // Awaited before the modal ever mounts - see RoiCrop.tsx's
+  // openRoiCropEditor for why (the same fix, applied there for the same
+  // reason after this exact race was confirmed live here first).
+  const modalToken = createToken();
+  await setDynamicRoiEditorOpen(true, modalToken).catch(() => {});
+
   let close = () => {};
   const modal = showModal(
     <ModalRoot bAllowFullSize onCancel={() => close()} closeModal={() => close()}>
-      <KeybindingsContent onClose={() => close()} />
+      <KeybindingsContent onClose={() => close()} modalToken={modalToken} />
     </ModalRoot>,
     window
   );
