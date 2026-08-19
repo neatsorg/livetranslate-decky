@@ -804,17 +804,22 @@ class DynamicCaptureRunner:
         finally:
             buffer.unmap(map_info)
 
-        if self.args.qam_open_flag and self.args.qam_open_flag.exists():
-            # QAM sidebar is currently open (index.tsx polls Steam's own
-            # openSideMenu state and sets this flag live - see
-            # PHASE_A_HANDOFF.md's 2026-08-19 section). Unlike --pause-flag
-            # below, this skips tap-to-translate too: while the QAM is open
-            # a touchscreen tap lands on the QAM's own UI, not the game, so
-            # there's no valid tap coordinate to service. Still pull/map/
-            # unmap every frame above to keep the GStreamer pipeline
-            # flowing without a backlog. Deliberately does not touch
-            # active_blocks.json - the whole point is to be invisible to
-            # whatever's already correctly displayed, unlike a user-
+        if (self.args.qam_open_flag and self.args.qam_open_flag.exists()) or (
+            self.args.status_toast_flag and self.args.status_toast_flag.exists()
+        ):
+            # Either the QAM sidebar is open (index.tsx polls Steam's own
+            # openSideMenu state and sets qam_open_flag live), or
+            # PlayTranslate's own StatusToast corner notification (L4
+            # refresh/pause/resume feedback, ~2s) is currently on screen -
+            # see PHASE_A_HANDOFF.md's 2026-08-19 section for both. Either
+            # way this is PlayTranslate's own screen content, not the game,
+            # so skip everything the same way, including tap-to-translate:
+            # a touchscreen tap during either state lands on that UI, not
+            # the game, so there's no valid tap coordinate to service. Still
+            # pull/map/unmap every frame above to keep the GStreamer
+            # pipeline flowing without a backlog. Deliberately does not
+            # touch active_blocks.json - the whole point is to be invisible
+            # to whatever's already correctly displayed, unlike a user-
             # requested pause.
             return Gst.FlowReturn.OK
 
@@ -1042,6 +1047,15 @@ def main():
         "(a tap now lands on the QAM UI, not the game). Created/removed by main.py's set_dynamic_qam_open(), driven by index.tsx polling Steam's own "
         "window.SteamUIStore...m_eOpenSideMenu - see PHASE_A_HANDOFF.md's 2026-08-19 QAM-cascade writeup for why this exists as a separate flag from "
         "--pause-flag rather than reusing it: a user-initiated pause and an automatic QAM-open suppression should not be able to clobber each other.",
+    )
+    parser.add_argument(
+        "--status-toast-flag",
+        type=Path,
+        help="If this path exists, skip all discovery/tracking/translation work each frame - PlayTranslate's own StatusToast corner notification "
+        "(L4 refresh/pause/resume feedback) is currently on screen. Found live 2026-08-19: the L4-refresh toast ('PlayTranslate: refreshed') was "
+        "itself getting OCR'd and 'translated' once --startup-delay was cut, since _own_overlay_regions() only masks PositionedOverlay's tracked "
+        "translation blocks, not this separate corner toast. Created/removed by main.py's set_dynamic_status_toast_visible(), called directly by "
+        "index.tsx's showToast() rather than polled, since the toast's on-screen window is entirely self-triggered - see PHASE_A_HANDOFF.md.",
     )
     parser.add_argument(
         "--tap-request",

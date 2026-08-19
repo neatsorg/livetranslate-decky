@@ -58,6 +58,7 @@ class Plugin:
         self.dynamic_log_path = self.data_dir / "playtranslate-dynamic-capture.log"
         self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
         self.dynamic_qam_open_flag_path = self.data_dir / "dynamic_qam_open.flag"
+        self.dynamic_status_toast_flag_path = self.data_dir / "dynamic_status_toast.flag"
         self.tap_request_path = self.data_dir / "tap_request.json"
         self.tap_result_path = self.data_dir / "tap_result.json"
         self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
@@ -1373,6 +1374,10 @@ class Plugin:
         except FileNotFoundError:
             pass
         try:
+            self.dynamic_status_toast_flag_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
             self.tap_request_path.unlink()
         except FileNotFoundError:
             pass
@@ -1417,6 +1422,8 @@ class Plugin:
             str(self.dynamic_pause_flag_path),
             "--qam-open-flag",
             str(self.dynamic_qam_open_flag_path),
+            "--status-toast-flag",
+            str(self.dynamic_status_toast_flag_path),
             "--tap-request",
             str(self.tap_request_path),
             "--tap-result",
@@ -1591,6 +1598,31 @@ class Plugin:
             except FileNotFoundError:
                 pass
         return {"qam_open": is_open}
+
+    async def set_dynamic_status_toast_visible(self, is_visible: bool):
+        """Called directly by index.tsx's showToast() around dispatching the
+        StatusToast corner notification (L4 refresh/pause/resume feedback),
+        not polled like set_dynamic_qam_open() above - the toast's on-screen
+        window is entirely self-triggered by that same call, so there's
+        nothing to poll for. Found live 2026-08-19: once --startup-delay
+        was cut, the L4-refresh toast itself ("PlayTranslate: refreshed")
+        started getting OCR'd and "translated" as if it were game dialogue,
+        since _own_overlay_regions() in capture_dynamic.py only masks
+        PositionedOverlay's tracked translation blocks, not this separate
+        toast. Same independence reasoning as set_dynamic_qam_open(): a
+        separate flag file, not a reuse of dynamic_pause_flag_path or
+        dynamic_qam_open_flag_path, and never touches active_blocks.json.
+        """
+        if not self._is_dynamic_running():
+            return {"status_toast_visible": False}
+        if is_visible:
+            self.dynamic_status_toast_flag_path.touch()
+        else:
+            try:
+                self.dynamic_status_toast_flag_path.unlink()
+            except FileNotFoundError:
+                pass
+        return {"status_toast_visible": is_visible}
 
     async def request_tap_translate(self, x, y):
         """Tap-to-translate: the frontend's L4+L2-hold + touch-long-press

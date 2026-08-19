@@ -142,6 +142,9 @@ const stopDynamicCapture = callable<[], DynamicStatus>("stop_dynamic_capture");
 const refreshDynamicCapture = callable<[], DynamicStatus>("refresh_dynamic_capture");
 const toggleDynamicPause = callable<[], PauseToggleResult>("toggle_dynamic_pause");
 const setDynamicQamOpen = callable<[boolean], { qam_open: boolean }>("set_dynamic_qam_open");
+const setDynamicStatusToastVisible = callable<[boolean], { status_toast_visible: boolean }>(
+  "set_dynamic_status_toast_visible"
+);
 const getDynamicStatus = callable<[], DynamicStatus>("dynamic_status");
 const requestTapTranslate = callable<[number, number], TapResult>("request_tap_translate");
 
@@ -197,6 +200,11 @@ const ACTIVE_BLOCKS_FRESHNESS_S = 15;
 // so a normal tap can't accidentally register as a long press.
 const DYNAMIC_LONG_PRESS_MS = 900;
 
+// StatusToast's own default visible duration (see its durationMs ?? 2000
+// below) plus a margin, for how long showToast() below should suppress
+// Dynamic Capture so the toast itself never gets OCR'd as game text.
+const STATUS_TOAST_SUPPRESS_MS = 2500;
+
 function startHotkeyPolling() {
   let hotkeyBusy = false;
   let pollingInput = false;
@@ -239,6 +247,11 @@ function startHotkeyPolling() {
     window.dispatchEvent(new CustomEvent("playtranslate-tap-mode-changed", { detail: { active } }));
   };
 
+  // Tracks the pending timer that clears status_toast_flag, so a second
+  // showToast() call before the first one's window closes reschedules
+  // instead of leaving a stale early-clearing timer behind.
+  let statusToastFlagTimer: number | null = null;
+
   const showHud = (text: string, blocks?: ActiveBlock[]) => {
     hudVisible = true;
     window.dispatchEvent(new CustomEvent("playtranslate-show-hud", { detail: { text, blocks } }));
@@ -251,6 +264,22 @@ function startHotkeyPolling() {
 
   const showToast = (text: string) => {
     window.dispatchEvent(new CustomEvent("playtranslate-status-toast", { detail: { text } }));
+    // StatusToast (below) renders this on screen for ~2s - suppress Dynamic
+    // Capture for that window so the toast itself never gets OCR'd and
+    // "translated" as if it were game dialogue (confirmed live 2026-08-19,
+    // see PHASE_A_HANDOFF.md - the L4-refresh toast was doing exactly this
+    // once --startup-delay was cut). Cancel+reschedule on repeat calls,
+    // matching StatusToast's own timer-reset logic, so a second toast
+    // firing before the first one's window closes doesn't let capture
+    // resume early while the second one is still showing.
+    setDynamicStatusToastVisible(true).catch(() => {});
+    if (statusToastFlagTimer !== null) {
+      window.clearTimeout(statusToastFlagTimer);
+    }
+    statusToastFlagTimer = window.setTimeout(() => {
+      statusToastFlagTimer = null;
+      setDynamicStatusToastVisible(false).catch(() => {});
+    }, STATUS_TOAST_SUPPRESS_MS);
   };
 
   const handleHudVisible = () => {
