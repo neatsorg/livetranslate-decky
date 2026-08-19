@@ -37,7 +37,9 @@ const startDynamicCaptureFixedRoi = callable<[Roi], DynamicStatus>("start_dynami
 // poll immediately overwrote "open" back to "false" while this modal (with
 // its own on-screen text) was still fully visible. This flag is driven
 // only by this component's own mount/unmount, so nothing else can race it.
-const setDynamicRoiEditorOpen = callable<[boolean], { roi_editor_open: boolean }>("set_dynamic_roi_editor_open");
+const setDynamicRoiEditorOpen = callable<[boolean, string], { roi_editor_open: boolean }>(
+  "set_dynamic_roi_editor_open"
+);
 
 const DEFAULT_ROI: Roi = { x_pct: 20, y_pct: 60, width_pct: 58, height_pct: 36 };
 
@@ -51,6 +53,13 @@ function round2(value: number): number {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function createToken(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `roi_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 // ModalRoot wraps children in a <form>, and Button renders a plain <button>
@@ -73,6 +82,7 @@ function RoiCropContent({ onClose }: { onClose: () => void }) {
   const [roi, setRoi] = useState<Roi>(DEFAULT_ROI);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>("");
+  const [modalToken] = useState(createToken);
 
   const loadScreenshot = useCallback(async () => {
     setLoadError("");
@@ -105,11 +115,11 @@ function RoiCropContent({ onClose }: { onClose: () => void }) {
   // protection while this is up - see setDynamicRoiEditorOpen's own
   // comment for why this has to be a dedicated flag, not qam_open reused.
   useEffect(() => {
-    setDynamicRoiEditorOpen(true).catch(() => {});
+    setDynamicRoiEditorOpen(true, modalToken).catch(() => {});
     return () => {
-      setDynamicRoiEditorOpen(false).catch(() => {});
+      setDynamicRoiEditorOpen(false, modalToken).catch(() => {});
     };
-  }, []);
+  }, [modalToken]);
 
   const updateRoi = (patch: Partial<Roi>) => {
     setRoi((prev) => {

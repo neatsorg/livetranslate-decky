@@ -63,6 +63,7 @@ from region_tracker import MultiRegionTracker
 # in principle exceed this on a very text-dense frame) so a pathological
 # discovery result can't fire dozens of simultaneous requests at the backend.
 DISCOVERY_TRANSLATE_MAX_WORKERS = 8
+ROI_EDITOR_STALE_S = 10 * 60
 
 
 def load_module(path, name):
@@ -174,6 +175,21 @@ def save_bgrx_crop_png(raw, width, height, bbox, out_path, pad=4):
         GLib.Bytes.new(bytes(rgb)), GdkPixbuf.Colorspace.RGB, False, 8, crop_w, crop_h, crop_w * 3
     )
     pixbuf.savev(str(out_path), "png", [], [])
+
+
+def _fresh_flag_exists(path, max_age_s=None):
+    if not path or not path.exists():
+        return False
+    if max_age_s is None:
+        return True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    opened_at = data.get("opened_at") if isinstance(data, dict) else None
+    if not isinstance(opened_at, (int, float)):
+        return True
+    return time.time() - opened_at < max_age_s
 
 
 def _mask_regions_bgrx(raw, width, height, regions):
@@ -862,7 +878,7 @@ class DynamicCaptureRunner:
         if (
             (self.args.qam_open_flag and self.args.qam_open_flag.exists())
             or (self.args.status_toast_flag and self.args.status_toast_flag.exists())
-            or (self.args.roi_editor_open_flag and self.args.roi_editor_open_flag.exists())
+            or _fresh_flag_exists(self.args.roi_editor_open_flag, ROI_EDITOR_STALE_S)
         ):
             # The QAM sidebar is open (index.tsx polls Steam's own
             # openSideMenu state and sets qam_open_flag live), or

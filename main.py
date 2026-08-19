@@ -21,6 +21,7 @@ _DEFAULT_GAME_ID = "enigma_of_fear"
 
 # Matches index.tsx's STATUS_TOAST_SUPPRESS_MS - see refresh_dynamic_capture().
 _STATUS_TOAST_SUPPRESS_S = 2.5
+_ROI_EDITOR_STALE_S = 10 * 60
 
 _DEFAULT_TRANSLATION_SETTINGS = {
     "engine": "ollama",
@@ -248,6 +249,12 @@ class Plugin:
             return path.read_text(encoding="utf-8", errors="replace").strip()
         except OSError as exc:
             return f"Could not read {path.name}: {exc}"
+
+    def _read_json_file(self, path):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
 
     def _translate_url(self):
         # Cloud engines (google/gemini/deepl) are served by a translate_server.py
@@ -888,9 +895,29 @@ class Plugin:
         return engine_dir / f"dynamic_roi.{game_id}.json"
 
     def _valid_roi(self, roi):
-        return isinstance(roi, dict) and all(
-            isinstance(roi.get(key), (int, float)) for key in ("x_pct", "y_pct", "width_pct", "height_pct")
-        )
+        return self._normalize_roi(roi) is not None
+
+    def _normalize_roi(self, roi):
+        if not isinstance(roi, dict):
+            return None
+        normalized = {}
+        for key in ("x_pct", "y_pct", "width_pct", "height_pct"):
+            value = roi.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return None
+            normalized[key] = round(float(value), 2)
+
+        if normalized["x_pct"] < 0 or normalized["y_pct"] < 0:
+            return None
+        if normalized["width_pct"] <= 0 or normalized["height_pct"] <= 0:
+            return None
+        if normalized["x_pct"] >= 100 or normalized["y_pct"] >= 100:
+            return None
+        if normalized["x_pct"] + normalized["width_pct"] > 100:
+            return None
+        if normalized["y_pct"] + normalized["height_pct"] > 100:
+            return None
+        return normalized
 
     async def get_dynamic_roi(self, game_id=None):
         game_id = str(game_id or "").strip() or self._get_active_game_id()
@@ -906,13 +933,17 @@ class Plugin:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc), "roi": None}
-        return {"ok": True, "roi": data.get("roi")}
+        roi = self._normalize_roi(data.get("roi"))
+        if roi is None:
+            return {"ok": False, "error": "saved roi is invalid", "roi": None}
+        return {"ok": True, "roi": roi}
 
     async def save_dynamic_roi(self, roi, game_id=None):
         game_id = str(game_id or "").strip() or self._get_active_game_id()
         if not self._valid_game_id(game_id):
             return {"ok": False, "error": "invalid game id"}
-        if not self._valid_roi(roi):
+        roi = self._normalize_roi(roi)
+        if roi is None:
             return {"ok": False, "error": "roi must include numeric x_pct/y_pct/width_pct/height_pct"}
         engine_dir, _capture_py, _config_json = self._find_engine()
         if not engine_dir:
@@ -1735,6 +1766,7 @@ class Plugin:
         if self._is_dynamic_running():
             await self.stop_dynamic_capture()
         self._dynamic_fixed_roi = fixed_roi
+        self._clear_stale_roi_editor_flag()
 
         if not script:
             return {
@@ -1851,9 +1883,10 @@ class Plugin:
     async def start_dynamic_capture_fixed_roi(self, roi):
         """QAM/crop-UI entry point for single-region dynamic mode - see
         start_dynamic_capture()'s fixed_roi param."""
-        if not self._valid_roi(roi):
+        roi = self._normalize_roi(roi)
+        if roi is None:
             return {"running": False, "error": "roi must include numeric x_pct/y_pct/width_pct/height_pct"}
-        return await self.start_dynamic_capture(fixed_roi=dict(roi))
+        return await self.start_dynamic_capture(fixed_roi=roi)
 
     async def stop_dynamic_capture(self):
         await self._kill_tracked_dynamic_process()
@@ -2043,8 +2076,11 @@ class Plugin:
         display at all.
         """
         if not self._is_dynamic_running():
+            if is_open:
+                self._clear_stale_roi_editor_flag()
             return {"qam_open": False}
         if is_open:
+            self._clear_stale_roi_editor_flag()
             self.dynamic_qam_open_flag_path.touch()
         else:
             try:
@@ -2053,7 +2089,24 @@ class Plugin:
                 pass
         return {"qam_open": is_open}
 
-    async def set_dynamic_roi_editor_open(self, is_open: bool):
+    def _read_roi_editor_flag(self):
+        data = self._read_json_file(self.dynamic_roi_editor_open_flag_path)
+        return data if isinstance(data, dict) else None
+
+    def _clear_stale_roi_editor_flag(self, max_age_s=_ROI_EDITOR_STALE_S):
+        data = self._read_roi_editor_flag()
+        if not data:
+            return False
+        opened_at = data.get("opened_at")
+        if isinstance(opened_at, (int, float)) and time.time() - opened_at < max_age_s:
+            return False
+        try:
+            self.dynamic_roi_editor_open_flag_path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+    async def set_dynamic_roi_editor_open(self, is_open: bool, token=None):
         """Driven by RoiCrop.tsx's own mount/unmount, not by QAM visibility -
         deliberately a separate flag from dynamic_qam_open_flag_path above,
         not a reuse of it. Confirmed live 2026-08-19: reusing that flag
@@ -2069,9 +2122,17 @@ class Plugin:
         capture_dynamic.py reads this file at startup like any other flag,
         no live "is it running" check needed on this side.
         """
+        token = str(token or "").strip()
+        if not token:
+            return {"roi_editor_open": self.dynamic_roi_editor_open_flag_path.exists(), "error": "token is required"}
         if is_open:
-            self.dynamic_roi_editor_open_flag_path.touch()
+            payload = {"token": token, "opened_at": time.time()}
+            self.dynamic_roi_editor_open_flag_path.parent.mkdir(parents=True, exist_ok=True)
+            self.dynamic_roi_editor_open_flag_path.write_text(json.dumps(payload), encoding="utf-8")
         else:
+            current = self._read_roi_editor_flag()
+            if current and current.get("token") != token:
+                return {"roi_editor_open": self.dynamic_roi_editor_open_flag_path.exists()}
             try:
                 self.dynamic_roi_editor_open_flag_path.unlink()
             except FileNotFoundError:
