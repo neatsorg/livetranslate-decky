@@ -17,6 +17,9 @@ import decky
 _GAME_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _DEFAULT_GAME_ID = "enigma_of_fear"
 
+# Matches index.tsx's STATUS_TOAST_SUPPRESS_MS - see refresh_dynamic_capture().
+_STATUS_TOAST_SUPPRESS_S = 2.5
+
 _DEFAULT_TRANSLATION_SETTINGS = {
     "engine": "ollama",
     "source_lang": "English",
@@ -59,6 +62,7 @@ class Plugin:
         self.dynamic_pause_flag_path = self.data_dir / "dynamic_paused.flag"
         self.dynamic_qam_open_flag_path = self.data_dir / "dynamic_qam_open.flag"
         self.dynamic_status_toast_flag_path = self.data_dir / "dynamic_status_toast.flag"
+        self._status_toast_clear_task = None
         self.tap_request_path = self.data_dir / "tap_request.json"
         self.tap_result_path = self.data_dir / "tap_result.json"
         self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
@@ -284,6 +288,28 @@ class Plugin:
     def _health_url(self):
         parsed = parse.urlparse(self._translate_url())
         return parse.urlunparse(parsed._replace(path="/health", params="", query="", fragment=""))
+
+    def _cache_clear_url(self):
+        parsed = parse.urlparse(self._translate_url())
+        return parse.urlunparse(parsed._replace(path="/cache/clear", params="", query="", fragment=""))
+
+    def _clear_translation_cache(self):
+        """Blocking - always called via asyncio.to_thread (see
+        refresh_dynamic_capture()), fire-and-forget, so a slow or
+        unreachable translate_server.py never adds latency to the
+        user-perceived Refresh action itself. Targets whichever server
+        _translate_url() currently resolves to (local Deck-spawned server
+        for cloud engines, or the configured Ollama host) - same server a
+        translation would actually go to right now.
+        """
+        url = self._cache_clear_url()
+        req = request.Request(url, data=b"", method="POST")
+        try:
+            with request.urlopen(req, timeout=5) as response:
+                body = json.loads(response.read().decode("utf-8", errors="replace"))
+                decky.logger.info(f"PlayTranslate: cleared translation cache ({body.get('cleared', '?')} entries) at {url}")
+        except (urlerror.URLError, OSError, ValueError) as exc:
+            decky.logger.warning(f"PlayTranslate: failed to clear translation cache at {url}: {exc}")
 
     def _clear_translation_outputs(self):
         for path in (self.translation_path, self.translation_json_path, self.translation_error_path):
@@ -1492,11 +1518,35 @@ class Plugin:
         judgement that "this looks wrong" is a better trigger than any
         heuristic here.
 
+        Also clears translate_server.py's translation cache (fire-and-
+        forget, see _clear_translation_cache()) - the QAM's own tooltip for
+        this button already promises a from-scratch restart, but until
+        2026-08-19 that never actually included the cache, so a single bad
+        OCR-noise translation (e.g. PlayTranslate's own UI text getting
+        misread once) could keep resurfacing verbatim with no way for the
+        user to clear it short of restarting translate_server.py by hand.
+        See PHASE_A_HANDOFF.md.
+
         Serialized by dynamic_refresh_lock so repeated presses queue behind
         each other's full stop/start cycle instead of interleaving - two
         overlapping stop+start sequences could otherwise race on
         self.dynamic_process (e.g. a second start() overwriting the tracked
         PID while the first stop() is still polling the old one).
+
+        Also pre-arms dynamic_status_toast_flag_path itself, synchronously,
+        right after the new process spawns - found live 2026-08-19 that
+        relying solely on index.tsx's showToast()->set_dynamic_status_
+        toast_visible() round trip (see that method) was too slow: with
+        --startup-delay now 0, the new process's first discovery can finish
+        before that RPC round trip (itself following the *entire* refresh
+        RPC this method just ran) ever lands, so "PlayTranslate: refreshed"
+        was still getting OCR'd and translated most times. Setting it here
+        instead closes the gap to a few lines of synchronous Python.
+        Self-clearing (not left for the frontend's showToast() to clear
+        alone) because this method is also called from the QAM's "Refresh
+        Dynamic Capture" button, which never calls showToast() at all - if
+        only the frontend cleared it, a QAM-triggered refresh would leave
+        capture permanently suppressed.
         """
         async with self.dynamic_refresh_lock:
             try:
@@ -1504,7 +1554,27 @@ class Plugin:
             except FileNotFoundError:
                 pass
             await self.stop_dynamic_capture()
-            return await self.start_dynamic_capture()
+            result = await self.start_dynamic_capture()
+            asyncio.create_task(asyncio.to_thread(self._clear_translation_cache))
+            self.dynamic_status_toast_flag_path.touch()
+            # Cancel any still-pending clear from an earlier refresh before
+            # scheduling this one's - without this, rapid repeated Refresh
+            # presses (mashing the QAM button, or L4) could let an older
+            # call's timer clear the flag while a newer refresh's process
+            # is still supposed to be protected by it.
+            if self._status_toast_clear_task is not None:
+                self._status_toast_clear_task.cancel()
+            self._status_toast_clear_task = asyncio.create_task(
+                self._clear_status_toast_flag_after(_STATUS_TOAST_SUPPRESS_S)
+            )
+            return result
+
+    async def _clear_status_toast_flag_after(self, delay_s):
+        await asyncio.sleep(delay_s)
+        try:
+            self.dynamic_status_toast_flag_path.unlink()
+        except FileNotFoundError:
+            pass
 
     def _tail_dynamic_log(self, lines=40):
         if not self.dynamic_log_path.exists():

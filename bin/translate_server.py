@@ -41,6 +41,14 @@ class TranslationCache:
             if len(self._store) > self._max_entries:
                 self._store.popitem(last=False)
 
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+
+    def size(self):
+        with self._lock:
+            return len(self._store)
+
 
 def load_profile(path):
     if not path:
@@ -85,6 +93,9 @@ class TranslateHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/cache/clear":
+            self._handle_cache_clear()
+            return
         if self.path != "/translate":
             self.send_json(404, {"error": "not found"})
             return
@@ -139,6 +150,17 @@ class TranslateHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(exc), "error_type": "provider_error"})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
+
+    def _handle_cache_clear(self):
+        # Called by main.py's refresh_dynamic_capture() - Refresh already
+        # promises (in its own QAM tooltip) to restart detection "from
+        # scratch", but until now that never included this cache, so a
+        # single bad OCR-noise translation (e.g. PlayTranslate's own UI text
+        # getting misread once) could keep resurfacing verbatim forever with
+        # no way for the user to clear it. See PHASE_A_HANDOFF.md.
+        cleared = self.server.cache.size()
+        self.server.cache.clear()
+        self.send_json(200, {"ok": True, "cleared": cleared})
 
     def log_message(self, fmt, *args):
         print(f"{self.client_address[0]} - {fmt % args}")
