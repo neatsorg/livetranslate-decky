@@ -137,14 +137,16 @@ class Plugin:
         await asyncio.gather(self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server())
 
     def _candidate_engine_dirs(self):
+        # bin/ inside this plugin is the only shipped location - the engine
+        # used to live in a sibling playtranslate-deck/ repo dir during
+        # development, but that's now merged into bin/ for distribution.
+        # PLAYTRANSLATE_ENGINE_DIR remains as a dev-only override to point
+        # at an out-of-tree engine checkout without touching bin/.
         env_dir = os.environ.get("PLAYTRANSLATE_ENGINE_DIR")
         if env_dir:
             yield Path(env_dir)
 
         yield self.plugin_dir / "bin"
-        yield self.plugin_dir.parent / "playtranslate-deck"
-        yield Path("/home/deck/project/playtranslate-deck")
-        yield Path("/home/user/project/playtranslate-deck")
 
     def _find_engine(self):
         for engine_dir in self._candidate_engine_dirs():

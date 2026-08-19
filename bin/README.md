@@ -1,12 +1,17 @@
-# playtranslate-deck
+# bin/ - PlayTranslate capture/OCR/translation engine
 
-Steam Deck game mode PoC for receiving Gamescope frames through PipeWire,
-cropping a region with GStreamer, and counting frames in Python through
-`appsink`.
+This directory is the Decky plugin's engine - see the [parent
+README](../README.md) for the full feature set and layout. It's a set of
+standalone Python scripts (not a package) launched as subprocesses by
+`main.py`, and can also be run and tested directly on a Steam Deck as
+described below.
 
-This intentionally does not do OCR, translation, networking, or overlay output
-yet. The first goal is to verify that a small program can receive live
-crop-ready frames from Gamescope.
+This README documents `capture.py`, the legacy fixed-region capture path
+that receives Gamescope frames through PipeWire and crops a region with
+GStreamer. `capture_dynamic.py` (the default Dynamic Capture engine) reuses
+the same PipeWire/GStreamer plumbing but adds full-frame text discovery,
+OCR, and translation on top - see `PHASE_A_HANDOFF.md` in the repo root
+for its design history.
 
 ## Assumptions Already Confirmed
 

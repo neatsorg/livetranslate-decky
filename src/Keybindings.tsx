@@ -80,9 +80,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-// See Calibration.tsx's preventFormSubmit - ModalRoot wraps its children in
-// a <form>, and Button/DialogButton defaults to type="submit", so every
-// click submits (and closes) the modal unless this stops it first.
+// ModalRoot wraps its children in a <form>, and Button/DialogButton
+// defaults to type="submit", so every click submits (and closes) the
+// modal unless this stops it first.
 function preventFormSubmit(handler: () => void) {
   return (event: { preventDefault(): void }) => {
     event.preventDefault();
@@ -318,9 +318,9 @@ function KeybindingsContent({ onClose }: { onClose: () => void }) {
   );
 }
 
-// See Calibration.tsx's openRegionCalibration for why this uses showModal +
-// ModalRoot rather than a plain div in the QAM panel (gamepad focus-nav,
-// dropdown portaling, and QAM's own right-third-of-screen clipping).
+// Uses showModal + ModalRoot rather than a plain div in the QAM panel
+// (gamepad focus-nav, dropdown portaling, and QAM's own right-third-of-
+// screen clipping) - same reasoning as RoiCrop.tsx's openRoiCropEditor.
 export function openKeybindings() {
   let close = () => {};
   const modal = showModal(

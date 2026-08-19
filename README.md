@@ -1,32 +1,44 @@
-# PlayTranslate Decky Plugin
+# PlayTranslate Decky Plugin (LiveTranslator-kun)
 
-Minimal Decky Loader control panel for the PlayTranslate capture engine.
+Decky Loader plugin that captures the screen through Gamescope/PipeWire, runs
+OCR on it, and overlays a live translation - built for game subtitles on
+Steam Deck.
 
-This first version only starts, stops, and checks the status of the existing
-`capture.py` process. OCR, translation, and overlay rendering are intentionally
-left for later steps.
+## Features
+
+- **Dynamic Capture** (default): full-frame text discovery and tracking, using
+  on-device Chrome Screen AI OCR (Tesseract kept as a debug fallback engine).
+  Supports both wide discovery and a single fixed-region crop mode.
+- **Legacy fixed-region capture** (`capture.py`): the original per-game
+  calibrated-ROI mode, still available and mutually exclusive with Dynamic
+  Capture. Not yet fully superseded.
+- **Multi-engine translation**: Ollama (local), Gemini, Google Translate,
+  Google Cloud Translate, DeepL - with an LRU translation cache.
+- **Tap-to-translate**: L4+L2 hold + touchscreen long-press, while paused.
+- **Configurable keybindings** for refresh / pause-resume / touch-translate.
+- QAM sidebar organized into Capture Control / Settings / Other Settings.
 
 ## Layout
 
-```text
-/home/user/project/
-  playtranslate-deck/
-    capture.py
-    config.json
+This is now a single self-contained folder:
 
-  playtranslate-decky/
-    plugin.json
-    main.py
-    src/index.tsx
+```text
+playtranslate-decky/
+  plugin.json
+  main.py           # Decky plugin backend
+  src/index.tsx      # frontend
+  bin/                # capture/OCR/translation engine (see bin/README.md)
+    capture.py
+    capture_dynamic.py
+    providers/
+    ...
 ```
 
-The backend searches for the engine in this order:
+`main.py`'s `_candidate_engine_dirs()` looks for the engine in:
 
-1. `PLAYTRANSLATE_ENGINE_DIR`
-2. `bin/` inside this plugin
-3. a sibling `playtranslate-deck` directory
-4. `/home/deck/project/playtranslate-deck`
-5. `/home/user/project/playtranslate-deck`
+1. `PLAYTRANSLATE_ENGINE_DIR` (dev-only override, points at an out-of-tree
+   engine checkout)
+2. `bin/` inside this plugin (the shipped location)
 
 ## Build
 
@@ -39,3 +51,6 @@ pnpm run build
 
 Copy the plugin folder to the Steam Deck's Decky plugin directory after build.
 The Deck does not need Node.js or pnpm to run the built plugin.
+
+For an existing Deck install, `../deploy/deploy_to_deck.sh` syncs a build
+over SSH instead - see that script for details.

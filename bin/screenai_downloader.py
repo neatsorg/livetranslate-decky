@@ -13,9 +13,9 @@ dependency: the URL scheme or package path could change upstream.
 
 Uses urllib only (no requests dependency) - this module runs inside
 main.py, the Decky plugin backend process, whose Python environment can't
-be assumed to have third-party packages installed (unlike
-playtranslate-deck's distrobox, which already pulls in Pillow/tesserocr
-etc. for ocr_worker.py).
+be assumed to have third-party packages installed (unlike the distrobox
+this bin/ directory's other scripts run in, which already pulls in
+Pillow/tesserocr etc. for ocr_worker.py).
 """
 import json
 import logging

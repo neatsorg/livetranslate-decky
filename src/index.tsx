@@ -849,8 +849,7 @@ function StatusToast() {
 // touch gesture), comfortably above an accidental brush of the screen.
 const TAP_LONG_PRESS_MS = 450;
 // Above this many screen pixels of movement, a held touch is treated as a
-// drag/swipe and the pending tap-translate is cancelled - same tap-vs-drag
-// convention as Calibration.tsx's CREATE_DRAG_THRESHOLD_PX.
+// drag/swipe and the pending tap-translate is cancelled.
 const TAP_MOVE_CANCEL_PX = 12;
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));

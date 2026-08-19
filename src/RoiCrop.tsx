@@ -65,7 +65,7 @@ function createToken(): string {
 // ModalRoot wraps children in a <form>, and Button renders a plain <button>
 // with no type attribute (defaults to submit) - without this, every click
 // submits the form and closes the modal before the handler's async work
-// finishes. Same fix as Calibration.tsx's preventFormSubmit().
+// finishes.
 function preventFormSubmit(handler: () => void) {
   return (event: { preventDefault(): void }) => {
     event.preventDefault();
@@ -73,9 +73,9 @@ function preventFormSubmit(handler: () => void) {
   };
 }
 
-// Deliberately just four sliders over a screenshot, not the draggable/
-// resizable multi-region editor in Calibration.tsx - this mode only ever
-// tracks one fixed region, so there's nothing to name, add, or remove.
+// Deliberately just four sliders over a screenshot, not a draggable/
+// resizable editor - this mode only ever tracks one fixed region, so
+// there's nothing to name, add, or remove.
 function RoiCropContent({ onClose }: { onClose: () => void }) {
   const [imageData, setImageData] = useState<string>("");
   const [loadError, setLoadError] = useState<string>("");
