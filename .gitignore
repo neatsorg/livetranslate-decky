@@ -1,5 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 node_modules/
 dist/
 out/
+
 *.log
 .DS_Store
+captures/
+last_translation*.txt
+last_translation*.json
+translation-debug.log
+translation-worker.log
