@@ -96,6 +96,7 @@ _PAD_KEY_RE = re.compile(r"^pad:([0-9a-f]{4}):([0-9a-f]{4}):(\d+):(?:0x([0-9a-f]
 # from gamescope's overlay-input-routing the way hidraw has, so this is a
 # "better than nothing" fallback, not a first-class path like "pad:".
 _PADEV_KEY_RE = re.compile(r"^padev:([0-9a-f]{4}):([0-9a-f]{4}):(\d+)$")
+_PAD_REPORT_MAX_BYTES = 64
 
 
 def _parse_pad_key(key):
@@ -115,6 +116,28 @@ def _parse_padev_key(key):
     if not match:
         return None
     return int(match.group(1), 16), int(match.group(2), 16), int(match.group(3))
+
+
+def _is_valid_external_key_spec(key):
+    kbd_match = _KBD_KEY_RE.match(key)
+    if kbd_match:
+        return int(kbd_match.group(1)) <= _EVDEV_KEY_MAX
+
+    pad = _parse_pad_key(key)
+    if pad:
+        _vendor, _product, offset, kind, value = pad
+        if not (0 <= offset < _PAD_REPORT_MAX_BYTES):
+            return False
+        if kind == "mask":
+            return 1 <= value <= 0xFF
+        return 1 <= value <= 0xFF
+
+    padev = _parse_padev_key(key)
+    if padev:
+        _vendor, _product, code = padev
+        return 0 <= code <= _EVDEV_KEY_MAX
+
+    return False
 
 
 # Reproduces today's hardcoded index.tsx behavior exactly: L4 alone (no
@@ -548,11 +571,7 @@ class Plugin:
     def _is_valid_key(self, key):
         if key in _VALID_KEYS:
             return True
-        if _KBD_KEY_RE.match(key):
-            return True
-        if _PAD_KEY_RE.match(key):
-            return True
-        return bool(_PADEV_KEY_RE.match(key))
+        return _is_valid_external_key_spec(key)
 
     def _is_valid_binding(self, binding):
         if not isinstance(binding, dict):
@@ -2019,19 +2038,23 @@ class Plugin:
         held = set()
         for (vendor, product), entries in by_device.items():
             fd = self._get_persistent_pad_fd(vendor, product)
-            if fd is not None:
-                messages = self._drain_fd_messages(fd, 64)
-                if messages is None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                    self._external_pad_fds.pop((vendor, product), None)
-                elif messages:
-                    # Only the most recent report reflects current state -
-                    # anything earlier in this batch was already superseded
-                    # by the time we got around to reading it.
-                    self._external_pad_last_report[(vendor, product)] = messages[-1]
+            if fd is None:
+                self._external_pad_last_report.pop((vendor, product), None)
+                continue
+            messages = self._drain_fd_messages(fd, 64)
+            if messages is None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self._external_pad_fds.pop((vendor, product), None)
+                self._external_pad_last_report.pop((vendor, product), None)
+                continue
+            if messages:
+                # Only the most recent report reflects current state -
+                # anything earlier in this batch was already superseded
+                # by the time we got around to reading it.
+                self._external_pad_last_report[(vendor, product)] = messages[-1]
             cached = self._external_pad_last_report.get((vendor, product))
             if cached is None:
                 continue
@@ -2054,6 +2077,17 @@ class Plugin:
         # time - a keyboard only sends an EV_KEY event on an actual state
         # change plus periodic auto-repeat, not a continuous stream.
         keyboard_paths = self._find_keyboards()
+        keyboard_path_set = set(keyboard_paths)
+        removed_paths = [path for path in self._keyboard_fds if path not in keyboard_path_set]
+        for path in removed_paths:
+            fd = self._keyboard_fds.pop(path, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if removed_paths:
+            self._keyboard_held.clear()
         for path in keyboard_paths:
             fd = self._keyboard_fds.get(path)
             if fd is None:
@@ -2068,6 +2102,7 @@ class Plugin:
                 except OSError:
                     pass
                 self._keyboard_fds.pop(path, None)
+                self._keyboard_held.clear()
                 continue
             for data in messages:
                 for offset in range(0, len(data) - _EVDEV_EVENT_SIZE + 1, _EVDEV_EVENT_SIZE):
@@ -2108,7 +2143,8 @@ class Plugin:
         # Same persistent-fd/drain pattern as _read_keyboard_held.
         padev_keys = self._padev_keys_referenced_by_bindings()
         if not padev_keys:
-            return set(self._padev_held)
+            self._padev_held.clear()
+            return set()
         by_device = {}
         for key_string, vendor, product, code in padev_keys:
             by_device.setdefault((vendor, product), []).append((key_string, code))
@@ -2118,9 +2154,13 @@ class Plugin:
             if fd is None:
                 path = self._find_evdev_path_for(vendor, product)
                 if path is None:
+                    for key_string, _code in entries:
+                        self._padev_held.discard(key_string)
                     continue
                 fd = self._open_nonblocking(path)
                 if fd is None:
+                    for key_string, _code in entries:
+                        self._padev_held.discard(key_string)
                     continue
                 self._padev_fds[(vendor, product)] = fd
             messages = self._drain_fd_messages(fd, _EVDEV_EVENT_SIZE * 64)
@@ -2130,6 +2170,8 @@ class Plugin:
                 except OSError:
                     pass
                 self._padev_fds.pop((vendor, product), None)
+                for key_string, _code in entries:
+                    self._padev_held.discard(key_string)
                 continue
             code_to_keys = {}
             for key_string, code in entries:
