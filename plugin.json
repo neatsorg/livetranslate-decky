@@ -1,7 +1,6 @@
 {
   "name": "LiveTranslator-kun",
   "author": "playtranslate-deck",
-  "flags": ["debug"],
   "api_version": 1,
   "publish": {
     "tags": ["translation", "overlay", "gamescope"],
