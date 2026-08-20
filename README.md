@@ -1,5 +1,7 @@
 # LiveTranslator-kun
 
+[English](./README.md) | [日本語](./README.ja.md)
+
 A [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin
 that captures the screen through Gamescope/PipeWire, recognizes text with
 OCR, and overlays the translation in real time.

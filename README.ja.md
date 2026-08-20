@@ -1,5 +1,7 @@
 # LiveTranslator-kun
 
+[English](./README.md) | [日本語](./README.ja.md)
+
 [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) 用プラグイン。
 Gamescope/PipeWire経由で画面をキャプチャし、OCRで文字を認識して、リアルタイムで
 翻訳結果をオーバーレイ表示します。
