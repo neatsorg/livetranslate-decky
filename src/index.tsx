@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { FaLanguage } from "react-icons/fa";
 import { SiKofi } from "react-icons/si";
-import { CompositionRequest, UIComposition } from "./Composition";
+import { CompositionRequest, UIComposition, forceOverlayHidden } from "./Composition";
 import { openKeybindings } from "./Keybindings";
 import { openRoiCropEditor } from "./RoiCrop";
 
@@ -116,7 +116,7 @@ const LANGUAGE_OPTIONS = [
   { data: "German", label: "German" },
 ];
 
-type HidrawTestResult = {
+type InputButtonTestResult = {
   success: boolean;
   device?: string;
   buttons: string[];
@@ -140,7 +140,7 @@ type ActiveBlocksState = {
 
 const getStatus = callable<[], CaptureStatus>("status");
 const translateLatest = callable<[], CaptureStatus>("translate_latest");
-const testHidrawButtonState = callable<[], HidrawTestResult>("test_hidraw_button_state");
+const testInputButtonState = callable<[], InputButtonTestResult>("test_input_button_state");
 const getActiveBlocks = callable<[], ActiveBlocksState>("get_active_blocks");
 const getTranslationSettings = callable<[], TranslationSettings>("get_translation_settings");
 const setTranslationSettings = callable<[Partial<TranslationSettings>], TranslationSettings>(
@@ -464,7 +464,7 @@ function startHotkeyPolling() {
 
     pollingInput = true;
     try {
-      const result = await testHidrawButtonState();
+      const result = await testInputButtonState();
       if (!result.success) {
         holdStart = null;
         resetGroupStates();
@@ -926,6 +926,18 @@ function TapTranslateOverlay() {
     if (!active) clearPending();
   }, [active]);
 
+  // Explicit nudge for when this overlay's own Overlay-level composition
+  // request (below) unmounts - see forceOverlayHidden's comment for why.
+  // Only registers a cleanup while active, so it fires exactly on the
+  // active->inactive transition (or unmount while still active), not on
+  // the initial mount.
+  useEffect(() => {
+    if (!active) return;
+    return () => {
+      forceOverlayHidden();
+    };
+  }, [active]);
+
   const fireTapTranslate = async (clientX: number, clientY: number) => {
     const rect = overlayRef.current?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return;
@@ -1163,6 +1175,13 @@ function PositionedOverlay() {
       if (isOpen !== lastOpen) {
         lastOpen = isOpen;
         setDynamicQamOpen(isOpen).catch(() => {});
+        // QAM itself is Steam's own UI (not something this plugin mounts/
+        // unmounts), so there's no component lifecycle to hook a cleanup
+        // into - nudge on the same open->closed transition detected here
+        // instead. See forceOverlayHidden's comment for why.
+        if (!isOpen) {
+          forceOverlayHidden();
+        }
       }
     };
     poll();

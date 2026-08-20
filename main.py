@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import fcntl
 import importlib.util
 import json
 import math
@@ -47,8 +48,11 @@ _DEFAULT_OCR_SETTINGS = {
     "chromescreenai": {"min_confidence": 0.5},
 }
 
-# The 18 bindable keys for the keybinding feature (no d-pad - see
-# keybinding UI design discussion). Dynamic Capture Start/Stop is
+# The 18 bindable keys native to the Steam Deck's own built-in controller
+# (read via hidraw - see _find_steamdeck_hidraw/_BUTTON_FIELDS - never
+# evdev; confirmed live 2026-08-20 this raw HID channel is the one thing
+# that survives gamescope's overlay input routing). No d-pad - see the
+# keybinding UI design discussion. Dynamic Capture Start/Stop is
 # deliberately never bindable, UI-button only.
 _VALID_KEYS = {
     "A", "B", "X", "Y",
@@ -59,6 +63,60 @@ _VALID_KEYS = {
 }
 _VALID_COMMANDS = {"refresh", "pause_resume", "touch_translate"}
 
+# External-device key identifiers - both self-describing, both captured
+# live from the user's own press (see capture_input_signal) rather than
+# picked from a label, which is what fixes external buttons never matching
+# the config screen (the original complaint that started this investigation):
+#   "kbd:<linux keycode int>" - e.g. "kbd:57" for space. A keyboard's evdev
+#   node was confirmed live 2026-08-20 to keep delivering events even while
+#   PlayTranslate's own HUD is up (266 clean KEY_SPACE events, in-game) -
+#   the overlay-routing problem that forced hidraw for gamepads doesn't
+#   apply to keyboards, so this needs no per-device calibration at all,
+#   just the universal standard keycode.
+#   "pad:<vendor hex4>:<product hex4>:<byte offset>:0x<bitmask hex>" - e.g.
+#   "pad:045e:0b20:14:0x40". Re-reading it just means "open a currently-
+#   connected hidraw device with this vendor:product, check this byte/bit" -
+#   the calibration *is* the key string. Confirmed live 2026-08-20 against
+#   two different Xbox Wireless Controller units (045E:0B20, 045E:0B13)
+#   that a pad's own hidraw node, unlike its evdev node, keeps delivering
+#   clean press/release events even in-game with the HUD up.
+#   A variant, "pad:<vendor>:<product>:<offset>:ge<threshold hex>", covers
+#   analog bytes (trigger depth etc.) instead of a clean digital bit - see
+#   capture_input_signal's candidate-confirmation window, added after a
+#   user report 2026-08-20 that L2/R2 on an Xbox pad were captured from a
+#   half-press (which happened to look like a clean single-bit change) and
+#   then never matched a full press (which sets multiple bits at once).
+_KBD_KEY_RE = re.compile(r"^kbd:(\d+)$")
+_PAD_KEY_RE = re.compile(r"^pad:([0-9a-f]{4}):([0-9a-f]{4}):(\d+):(?:0x([0-9a-f]+)|ge([0-9a-f]+))$")
+# "padev:<vendor>:<product>:<EV_KEY code>" - fallback for a gamepad with no
+# hidraw node at all (confirmed live 2026-08-20: a USB Xbox controller
+# bound to the `xpad` kernel driver never gets one, unlike the same
+# controller family over Bluetooth via hid-generic, which does). Digital
+# buttons only, via plain evdev - no analog triggers, and no protection
+# from gamescope's overlay-input-routing the way hidraw has, so this is a
+# "better than nothing" fallback, not a first-class path like "pad:".
+_PADEV_KEY_RE = re.compile(r"^padev:([0-9a-f]{4}):([0-9a-f]{4}):(\d+)$")
+
+
+def _parse_pad_key(key):
+    match = _PAD_KEY_RE.match(key)
+    if not match:
+        return None
+    vendor = int(match.group(1), 16)
+    product = int(match.group(2), 16)
+    offset = int(match.group(3))
+    if match.group(4) is not None:
+        return vendor, product, offset, "mask", int(match.group(4), 16)
+    return vendor, product, offset, "threshold", int(match.group(5), 16)
+
+
+def _parse_padev_key(key):
+    match = _PADEV_KEY_RE.match(key)
+    if not match:
+        return None
+    return int(match.group(1), 16), int(match.group(2), 16), int(match.group(3))
+
+
 # Reproduces today's hardcoded index.tsx behavior exactly: L4 alone (no
 # long-press) refreshes, L4 alone held past 900ms pauses/resumes, L4+L2
 # held (while paused) enters tap-translate mode.
@@ -67,10 +125,43 @@ _DEFAULT_KEYBINDING_SETTINGS = {
         {"id": "default_refresh", "command": "refresh", "keys": ["L4"], "long_press": False, "threshold_ms": 900},
         {"id": "default_pause_resume", "command": "pause_resume", "keys": ["L4"], "long_press": True, "threshold_ms": 900},
         {"id": "default_touch_translate", "command": "touch_translate", "keys": ["L4", "L2"], "long_press": False, "threshold_ms": 900},
-    ]
+    ],
 }
 _MIN_KEYBINDING_THRESHOLD_MS = 300
 _MAX_KEYBINDING_THRESHOLD_MS = 3000
+
+_BUILT_IN_HID_VENDOR = 0x28DE
+_BUILT_IN_HID_PRODUCT = 0x1205
+
+# Real keyboards expose both a letter key and space - distinguishes them
+# from single-purpose EV_KEY devices (power button, lid switch, etc.) that
+# only carry 1-2 unrelated codes. linux/input-event-codes.h; KEY_SPACE=0x39
+# confirmed live 2026-08-20 against a real Bluetooth keyboard.
+_KEY_A = 0x1E
+_KEY_SPACE = 0x39
+
+_EVDEV_EV_KEY = 0x01
+_EVDEV_KEY_MAX = 0x2FF
+_EVDEV_KEY_BITS_BYTES = (_EVDEV_KEY_MAX // 8) + 1
+_EVDEV_NAME_BUF_LEN = 256
+# struct input_event on 64-bit Linux: struct timeval (2 longs) + __u16 type +
+# __u16 code + __s32 value = 24 bytes, no padding (offsets already aligned).
+_EVDEV_EVENT_FORMAT = "llHHi"
+_EVDEV_EVENT_SIZE = struct.calcsize(_EVDEV_EVENT_FORMAT)
+# struct input_id: 4 x __u16 (bustype, vendor, product, version) = 8 bytes.
+_EVDEV_ID_FORMAT = "<HHHH"
+_EVDEV_ID_SIZE = struct.calcsize(_EVDEV_ID_FORMAT)
+
+
+def _ioc(direction, type_char, nr, size):
+    # Reimplements the asm-generic _IOC()/_IOR() macros (no ioctl constants
+    # module ships these for evdev specifically) - direction 2 = _IOC_READ.
+    return (direction << 30) | (ord(type_char) << 8) | nr | (size << 16)
+
+
+_EVIOCGBIT_KEY = _ioc(2, "E", 0x20 + _EVDEV_EV_KEY, _EVDEV_KEY_BITS_BYTES)
+_EVIOCGID = _ioc(2, "E", 0x02, _EVDEV_ID_SIZE)
+_EVIOCGNAME = _ioc(2, "E", 0x06, _EVDEV_NAME_BUF_LEN)
 
 
 class Plugin:
@@ -128,15 +219,69 @@ class Plugin:
         self.dynamic_translation_config_path = self.data_dir / "dynamic_translation_config.json"
         self.keybinding_settings_path = self.data_dir / "keybindings.json"
         self.hidraw_path = None
+        # Cached (vendor, product, offset, mask) tuples parsed from every
+        # "pad:..." key across the *current* bindings, so the 150ms hotkey
+        # poll (test_input_button_state) never re-parses keybindings.json -
+        # see set_keybinding_settings, which invalidates this on save.
+        self._pad_keys_cache = None
+        # Persistent held-state, updated incrementally as press/release
+        # events arrive over many poll ticks - both the external pad and
+        # the keyboard only send a report/event *on change*, unlike the
+        # built-in controller's continuous stream, so "what's held right
+        # now" has to be remembered across ticks rather than re-derived
+        # from whatever (if anything) arrived in this tick's short window.
+        self._keyboard_held = set()
+        self._external_pad_last_report = {}
+        # hidraw path cache for external pads, keyed by (vendor, product) -
+        # /dev/hidrawN indices are NOT stable across reconnects (confirmed
+        # live 2026-08-20: two controllers swapped hidraw node numbers
+        # mid-session), so this is re-validated (not blindly trusted) on
+        # every lookup - see _find_hidraw_path_for.
+        self._pad_hidraw_path_cache = {}
+        self._keyboard_paths_cache = None
+        # Kept open across poll ticks rather than opened+closed each time -
+        # confirmed live 2026-08-20 that opening/closing every ~150ms tick
+        # (with the fd only actually open for a short read window each
+        # time) could silently drop a report that arrived in the closed
+        # gap: hidraw/evdev only deliver a report to fds that are open at
+        # the moment it happens, nothing is queued for a future opener. A
+        # dropped *release* report in particular left a long-press binding
+        # stuck reading as permanently held. See _drain_fd_messages.
+        self._external_pad_fds = {}
+        self._keyboard_fds = {}
+        # "padev:" fallback (evdev, digital-only) for a gamepad with no
+        # hidraw node at all - see _find_external_evdev_gamepads.
+        self._padev_keys_cache = None
+        self._padev_held = set()
+        self._padev_fds = {}
+        self._padev_path_cache = {}
         self.ocr_setup_log_path = self.data_dir / "ocr-setup.log"
 
     async def _main(self):
         decky.logger.info("PlayTranslate loaded")
 
+    def _close_persistent_input_fds(self):
+        # Raw fds from os.open() aren't closed by garbage collection the
+        # way Python file objects are - explicit cleanup so a Decky
+        # hot-reload (new Plugin instance, same process) doesn't leak them.
+        for fd in (
+            list(self._external_pad_fds.values())
+            + list(self._keyboard_fds.values())
+            + list(self._padev_fds.values())
+        ):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._external_pad_fds.clear()
+        self._keyboard_fds.clear()
+        self._padev_fds.clear()
+
     async def _unload(self):
         await asyncio.gather(
             self.stop_capture(), self.stop_dynamic_capture(), self._stop_translate_server(), self._stop_ocr_setup()
         )
+        self._close_persistent_input_fds()
         decky.logger.info("PlayTranslate unloaded")
 
     async def _uninstall(self):
@@ -400,6 +545,15 @@ class Plugin:
                 await self._ensure_ocr_worker(engine_dir)
         return new
 
+    def _is_valid_key(self, key):
+        if key in _VALID_KEYS:
+            return True
+        if _KBD_KEY_RE.match(key):
+            return True
+        if _PAD_KEY_RE.match(key):
+            return True
+        return bool(_PADEV_KEY_RE.match(key))
+
     def _is_valid_binding(self, binding):
         if not isinstance(binding, dict):
             return False
@@ -408,7 +562,9 @@ class Plugin:
         keys = binding.get("keys")
         if not isinstance(keys, list) or not (1 <= len(keys) <= 3):
             return False
-        if len(set(keys)) != len(keys) or any(key not in _VALID_KEYS for key in keys):
+        if not all(isinstance(key, str) for key in keys):
+            return False
+        if len(set(keys)) != len(keys) or any(not self._is_valid_key(key) for key in keys):
             return False
         if not isinstance(binding.get("long_press"), bool):
             return False
@@ -473,6 +629,12 @@ class Plugin:
             return {"ok": False, "error": "duplicate binding (same keys + same long-press setting) across commands"}
         new = {"bindings": bindings}
         self._save_keybinding_settings(new)
+        # Invalidates the poll-time cache of which external pad devices are
+        # currently referenced by any binding - see _pad_keys_referenced_by_
+        # bindings/_padev_keys_referenced_by_bindings, recomputed lazily on
+        # the next 150ms tick.
+        self._pad_keys_cache = None
+        self._padev_keys_cache = None
         decky.logger.info(f"PlayTranslate keybindings updated: {new}")
         return {"ok": True, **new}
 
@@ -1614,8 +1776,598 @@ class Plugin:
                 except OSError:
                     pass
 
-    async def test_hidraw_button_state(self):
-        return await asyncio.to_thread(self._read_hidraw_buttons_once)
+    # ---- external hidraw gamepad discovery -------------------------------
+
+    def _hidraw_uevent_info(self, index):
+        uevent_path = Path(f"/sys/class/hidraw/hidraw{index}/device/uevent")
+        try:
+            content = uevent_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        vendor = product = None
+        name = None
+        for line in content.splitlines():
+            if line.startswith("HID_ID="):
+                parts = line[len("HID_ID=") :].split(":")
+                if len(parts) == 3:
+                    try:
+                        vendor = int(parts[1], 16) & 0xFFFF
+                        product = int(parts[2], 16) & 0xFFFF
+                    except ValueError:
+                        vendor = product = None
+            elif line.startswith("HID_NAME="):
+                name = line[len("HID_NAME=") :]
+        if vendor is None or product is None:
+            return None
+        return {"vendor": vendor, "product": product, "name": name or f"{vendor:04x}:{product:04x}"}
+
+    def _find_external_hidraw_gamepads(self):
+        # No cheap capability query exists for hidraw the way EVIOCGBIT does
+        # for evdev, so this returns every non-built-in hidraw node as a
+        # capture candidate - the user's own press during capture_input_
+        # signal is what disambiguates which one is actually a gamepad.
+        # Always a fresh scan (unlike _find_hidraw_path_for's cached lookup
+        # used by the hot polling path) since this only runs during the
+        # rare, latency-insensitive interactive capture flow.
+        candidates = []
+        for i in range(16):
+            path = Path(f"/dev/hidraw{i}")
+            if not path.exists():
+                continue
+            info = self._hidraw_uevent_info(i)
+            if not info:
+                continue
+            if info["vendor"] == _BUILT_IN_HID_VENDOR and info["product"] == _BUILT_IN_HID_PRODUCT:
+                continue
+            candidates.append({"path": path, "vendor": info["vendor"], "product": info["product"], "name": info["name"]})
+        return candidates
+
+    def _find_hidraw_path_for(self, vendor, product):
+        # /dev/hidrawN indices are NOT stable across reconnects (confirmed
+        # live 2026-08-20: two controllers swapped node numbers mid-
+        # session), so the cache is re-validated against a fresh uevent
+        # read, not just trusted because a path with that name still exists.
+        cached = self._pad_hidraw_path_cache.get((vendor, product))
+        if cached and cached.exists():
+            index = cached.name.replace("hidraw", "")
+            info = self._hidraw_uevent_info(index)
+            if info and info["vendor"] == vendor and info["product"] == product:
+                return cached
+        for i in range(16):
+            path = Path(f"/dev/hidraw{i}")
+            if not path.exists():
+                continue
+            info = self._hidraw_uevent_info(i)
+            if info and info["vendor"] == vendor and info["product"] == product:
+                self._pad_hidraw_path_cache[(vendor, product)] = path
+                return path
+        self._pad_hidraw_path_cache.pop((vendor, product), None)
+        return None
+
+    # ---- evdev gamepad fallback (no hidraw node available) ----------------
+
+    def _evdev_id_info(self, path):
+        # Cheap check used both to discover "padev:" candidates and to
+        # re-validate a cached path - EVIOCGID for vendor:product, EVIOCGBIT
+        # for the same BTN_SOUTH "is this gamepad-shaped" heuristic used
+        # elsewhere in this file.
+        fd = self._open_nonblocking(path)
+        if fd is None:
+            return None
+        try:
+            id_bytes = fcntl.ioctl(fd, _EVIOCGID, bytes(_EVDEV_ID_SIZE))
+            _bustype, vendor, product, _version = struct.unpack(_EVDEV_ID_FORMAT, id_bytes)
+            key_bits = fcntl.ioctl(fd, _EVIOCGBIT_KEY, bytes(_EVDEV_KEY_BITS_BYTES))
+
+            def has_key(code):
+                return (key_bits[code // 8] >> (code % 8)) & 1
+
+            if not has_key(0x130):  # BTN_SOUTH
+                return None
+            name_buf = fcntl.ioctl(fd, _EVIOCGNAME, b"\x00" * _EVDEV_NAME_BUF_LEN)
+            name = name_buf.split(b"\x00", 1)[0].decode("utf-8", errors="replace") or str(path)
+            return {"vendor": vendor & 0xFFFF, "product": product & 0xFFFF, "name": name}
+        except OSError:
+            return None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _find_external_evdev_gamepads(self):
+        # Only a fallback for devices with no hidraw node at all - skip any
+        # vendor:product that already has one (hidraw is strictly better:
+        # confirmed live 2026-08-20 it survives gamescope's overlay input
+        # routing during actual gameplay, evdev doesn't).
+        hidraw_devices = {(c["vendor"], c["product"]) for c in self._find_external_hidraw_gamepads()}
+        candidates = []
+        for i in range(64):
+            path = Path(f"/dev/input/event{i}")
+            if not path.exists():
+                continue
+            info = self._evdev_id_info(path)
+            if not info:
+                continue
+            if (info["vendor"], info["product"]) in hidraw_devices:
+                continue
+            if info["vendor"] == _BUILT_IN_HID_VENDOR and info["product"] == _BUILT_IN_HID_PRODUCT:
+                continue
+            candidates.append({"path": path, "vendor": info["vendor"], "product": info["product"], "name": info["name"]})
+        return candidates
+
+    def _find_evdev_path_for(self, vendor, product):
+        cached = self._padev_path_cache.get((vendor, product))
+        if cached and cached.exists():
+            info = self._evdev_id_info(cached)
+            if info and info["vendor"] == vendor and info["product"] == product:
+                return cached
+        for i in range(64):
+            path = Path(f"/dev/input/event{i}")
+            if not path.exists():
+                continue
+            info = self._evdev_id_info(path)
+            if info and info["vendor"] == vendor and info["product"] == product:
+                self._padev_path_cache[(vendor, product)] = path
+                return path
+        self._padev_path_cache.pop((vendor, product), None)
+        return None
+
+    # ---- keyboard discovery ------------------------------------------------
+
+    def _find_keyboards(self, force_rescan=False):
+        if not force_rescan and self._keyboard_paths_cache and all(p.exists() for p in self._keyboard_paths_cache):
+            return self._keyboard_paths_cache
+        found = []
+        for i in range(64):
+            path = Path(f"/dev/input/event{i}")
+            if not path.exists():
+                continue
+            fd = None
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                key_bits = fcntl.ioctl(fd, _EVIOCGBIT_KEY, bytes(_EVDEV_KEY_BITS_BYTES))
+
+                def has_key(code, bits=key_bits):
+                    return (bits[code // 8] >> (code % 8)) & 1
+
+                if has_key(_KEY_A) and has_key(_KEY_SPACE):
+                    found.append(path)
+            except OSError:
+                pass
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        self._keyboard_paths_cache = found
+        return found
+
+    # ---- shared helpers ------------------------------------------------
+
+    @staticmethod
+    def _open_nonblocking(path):
+        try:
+            return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return None
+
+    # ---- 150ms hotkey polling -------------------------------------------
+
+    def _pad_keys_referenced_by_bindings(self):
+        # Cached, invalidated by set_keybinding_settings - avoids a JSON
+        # read+parse every 150ms tick.
+        if self._pad_keys_cache is None:
+            settings = self._load_keybinding_settings()
+            parsed = []
+            seen = set()
+            for binding in settings.get("bindings", []):
+                for key in binding.get("keys", []):
+                    if key in seen:
+                        continue
+                    info = _parse_pad_key(key)
+                    if info:
+                        seen.add(key)
+                        parsed.append((key, *info))
+            self._pad_keys_cache = parsed
+        return self._pad_keys_cache
+
+    @staticmethod
+    def _drain_fd_messages(fd, chunk_size, max_reads=64):
+        # Non-blocking drain of everything currently queued on fd, returned
+        # as a list of individual read()s - both hidraw (one read() = one
+        # complete report, message-oriented) and evdev (one or more whole
+        # input_event structs per read()) are safe to read repeatedly like
+        # this until EAGAIN. Returns None on a real I/O error (caller should
+        # treat the fd as dead and reopen it next time), or [] if nothing
+        # was queued.
+        messages = []
+        for _ in range(max_reads):
+            try:
+                data = os.read(fd, chunk_size)
+            except BlockingIOError:
+                break
+            except OSError:
+                return None
+            if not data:
+                break
+            messages.append(data)
+        return messages
+
+    def _get_persistent_pad_fd(self, vendor, product):
+        fd = self._external_pad_fds.get((vendor, product))
+        if fd is not None:
+            return fd
+        path = self._find_hidraw_path_for(vendor, product)
+        if not path:
+            return None
+        fd = self._open_nonblocking(path)
+        if fd is None:
+            return None
+        self._external_pad_fds[(vendor, product)] = fd
+        return fd
+
+    def _read_external_pad_held(self):
+        pad_keys = self._pad_keys_referenced_by_bindings()
+        if not pad_keys:
+            return set()
+        by_device = {}
+        for key_string, vendor, product, offset, kind, value in pad_keys:
+            by_device.setdefault((vendor, product), []).append((key_string, offset, kind, value))
+
+        held = set()
+        for (vendor, product), entries in by_device.items():
+            fd = self._get_persistent_pad_fd(vendor, product)
+            if fd is not None:
+                messages = self._drain_fd_messages(fd, 64)
+                if messages is None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self._external_pad_fds.pop((vendor, product), None)
+                elif messages:
+                    # Only the most recent report reflects current state -
+                    # anything earlier in this batch was already superseded
+                    # by the time we got around to reading it.
+                    self._external_pad_last_report[(vendor, product)] = messages[-1]
+            cached = self._external_pad_last_report.get((vendor, product))
+            if cached is None:
+                continue
+            for key_string, offset, kind, value in entries:
+                if offset >= len(cached):
+                    continue
+                # "mask" = a clean digital bit flag (AND check); "threshold"
+                # = an analog byte (trigger depth etc.), pressed once its
+                # magnitude crosses the midpoint captured between idle and
+                # fully-pressed - see capture_input_signal/_scan_pad_capture.
+                if kind == "mask" and (cached[offset] & value):
+                    held.add(key_string)
+                elif kind == "threshold" and cached[offset] >= value:
+                    held.add(key_string)
+        return held
+
+    def _read_keyboard_held(self):
+        # Persists press/release state on self._keyboard_held across ticks
+        # (see __init__'s comment) rather than deriving "held" fresh each
+        # time - a keyboard only sends an EV_KEY event on an actual state
+        # change plus periodic auto-repeat, not a continuous stream.
+        keyboard_paths = self._find_keyboards()
+        for path in keyboard_paths:
+            fd = self._keyboard_fds.get(path)
+            if fd is None:
+                fd = self._open_nonblocking(path)
+                if fd is None:
+                    continue
+                self._keyboard_fds[path] = fd
+            messages = self._drain_fd_messages(fd, _EVDEV_EVENT_SIZE * 64)
+            if messages is None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self._keyboard_fds.pop(path, None)
+                continue
+            for data in messages:
+                for offset in range(0, len(data) - _EVDEV_EVENT_SIZE + 1, _EVDEV_EVENT_SIZE):
+                    _sec, _usec, ev_type, code, value = struct.unpack(
+                        _EVDEV_EVENT_FORMAT, data[offset : offset + _EVDEV_EVENT_SIZE]
+                    )
+                    if ev_type != _EVDEV_EV_KEY:
+                        continue
+                    key = f"kbd:{code}"
+                    if value == 1:
+                        self._keyboard_held.add(key)
+                    elif value == 0:
+                        self._keyboard_held.discard(key)
+                    # value == 2 (auto-repeat): already held, no change.
+        return set(self._keyboard_held)
+
+    def _padev_keys_referenced_by_bindings(self):
+        # Cached, invalidated by set_keybinding_settings - mirrors
+        # _pad_keys_referenced_by_bindings for "padev:" (evdev-fallback) keys.
+        if self._padev_keys_cache is None:
+            settings = self._load_keybinding_settings()
+            parsed = []
+            seen = set()
+            for binding in settings.get("bindings", []):
+                for key in binding.get("keys", []):
+                    if key in seen:
+                        continue
+                    info = _parse_padev_key(key)
+                    if info:
+                        seen.add(key)
+                        parsed.append((key, *info))
+            self._padev_keys_cache = parsed
+        return self._padev_keys_cache
+
+    def _read_evdev_pad_held(self):
+        # Digital-only fallback reader for "padev:" keys - see
+        # _find_external_evdev_gamepads for why this path exists at all.
+        # Same persistent-fd/drain pattern as _read_keyboard_held.
+        padev_keys = self._padev_keys_referenced_by_bindings()
+        if not padev_keys:
+            return set(self._padev_held)
+        by_device = {}
+        for key_string, vendor, product, code in padev_keys:
+            by_device.setdefault((vendor, product), []).append((key_string, code))
+
+        for (vendor, product), entries in by_device.items():
+            fd = self._padev_fds.get((vendor, product))
+            if fd is None:
+                path = self._find_evdev_path_for(vendor, product)
+                if path is None:
+                    continue
+                fd = self._open_nonblocking(path)
+                if fd is None:
+                    continue
+                self._padev_fds[(vendor, product)] = fd
+            messages = self._drain_fd_messages(fd, _EVDEV_EVENT_SIZE * 64)
+            if messages is None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self._padev_fds.pop((vendor, product), None)
+                continue
+            code_to_keys = {}
+            for key_string, code in entries:
+                code_to_keys.setdefault(code, []).append(key_string)
+            for data in messages:
+                for offset in range(0, len(data) - _EVDEV_EVENT_SIZE + 1, _EVDEV_EVENT_SIZE):
+                    _sec, _usec, ev_type, code, value = struct.unpack(
+                        _EVDEV_EVENT_FORMAT, data[offset : offset + _EVDEV_EVENT_SIZE]
+                    )
+                    if ev_type != _EVDEV_EV_KEY:
+                        continue
+                    for key_string in code_to_keys.get(code, ()):
+                        if value == 1:
+                            self._padev_held.add(key_string)
+                        elif value == 0:
+                            self._padev_held.discard(key_string)
+        return set(self._padev_held)
+
+    def _read_current_input_buttons(self, timeout=0.2):
+        # Unions three always-available-if-present sources into one flat
+        # buttons list, matching index.tsx's existing single-array
+        # assumption exactly - see PHASE_A/humming-growing-mist.md's plan
+        # for why built-in stays on hidraw, external pads moved to hidraw
+        # (confirmed live 2026-08-20 evdev gets starved of gamepad events
+        # while PlayTranslate's own HUD is up), and keyboard stays on plain
+        # evdev (confirmed immune to that same starvation).
+        buttons = set()
+
+        built_in_result = self._read_hidraw_buttons_once(timeout=timeout)
+        if built_in_result.get("success"):
+            buttons.update(built_in_result.get("buttons", []))
+
+        buttons.update(self._read_keyboard_held())
+        buttons.update(self._read_external_pad_held())
+        buttons.update(self._read_evdev_pad_held())
+
+        return {"success": True, "buttons": sorted(buttons)}
+
+    async def test_input_button_state(self):
+        return await asyncio.to_thread(self._read_current_input_buttons)
+
+    # ---- interactive capture (Keybindings.tsx "press a button") --------
+
+    def _scan_builtin_capture(self, data):
+        if len(data) < 16:
+            return None
+        for field in self._BUTTON_FIELDS:
+            if data[field["offset"]] & field["mask"]:
+                return {
+                    "success": True,
+                    "key": field["name"],
+                    "label": f"{field['name']} (Steam Deck Controller)",
+                }
+        return None
+
+    # How long to keep watching a candidate byte after it first moves away
+    # from idle, before deciding whether it was a clean digital button or an
+    # analog axis (trigger depth etc.) - added after a live user report
+    # 2026-08-20 that L2/R2 on an Xbox pad captured fine from a half-press
+    # (which happened to look like a clean single-bit change) but never
+    # matched a full press (which sets multiple bits in the same byte at
+    # once, since it's really a magnitude, not a flag).
+    _PAD_CAPTURE_CONFIRM_S = 0.6
+
+    def _finalize_pad_candidate(self, source):
+        # Split out from _scan_pad_capture so the main capture loop can also
+        # call this when a candidate's confirmation window expires with no
+        # *further* data on that fd (a trigger held steady at full depth
+        # may simply stop sending new reports once its value settles -
+        # relying only on "scan gets called again when new data arrives"
+        # would leave that candidate stuck pending forever).
+        candidate_offset = source.pop("candidate_offset", None)
+        if candidate_offset is None:
+            return None
+        base_value = source.pop("candidate_baseline_value")
+        max_value = source.pop("candidate_max_value")
+        source.pop("candidate_deadline", None)
+        diff = max_value ^ base_value
+        if diff == 0:
+            return None
+        if (diff & (diff - 1)) == 0:
+            # Clean single-bit change even at its deepest - a real digital
+            # button, not an analog axis.
+            mask = diff
+            key = f"pad:{source['vendor']:04x}:{source['product']:04x}:{candidate_offset}:0x{mask:02x}"
+            detail = f"{candidate_offset}:0x{mask:02x}"
+        else:
+            # Multiple bits moved - an analog axis. Threshold at the
+            # midpoint between idle and fully-pressed, matching the same
+            # "digital soft-pull click, not the raw analog axis" spirit as
+            # the built-in controller's own L2/R2 fields.
+            threshold = base_value + max(1, (max_value - base_value) // 2)
+            key = f"pad:{source['vendor']:04x}:{source['product']:04x}:{candidate_offset}:ge{threshold:02x}"
+            detail = f"{candidate_offset}:ge{threshold:02x}"
+        # Includes the raw offset/mask-or-threshold in the label, not just
+        # the controller name - there's no semantic button name available
+        # from a raw HID report the way the built-in controller's own
+        # hand-measured table has one, so this is what lets the user tell
+        # different captured buttons on the same pad apart in the list.
+        return {"success": True, "key": key, "label": f"Button {detail} ({source['name']})"}
+
+    def _scan_pad_capture(self, data, source):
+        baseline = source.get("baseline")
+        if baseline is None or len(data) != len(baseline):
+            source["baseline"] = data
+            source.pop("candidate_offset", None)
+            return None
+
+        candidate_offset = source.get("candidate_offset")
+        if candidate_offset is None:
+            changed = [i for i in range(len(data)) if data[i] != baseline[i]]
+            if len(changed) != 1:
+                # Noisy/multi-byte change (analog stick drift etc.) - not a
+                # clean single-source signal, keep waiting with a fresh
+                # baseline.
+                source["baseline"] = data
+                return None
+            offset = changed[0]
+            if not (data[offset] & (data[offset] ^ baseline[offset])):
+                source["baseline"] = data
+                return None  # a 1->0 transition (release) - wait for a press
+            # Found a byte moving away from idle - don't commit yet, watch
+            # it for a short confirmation window to see how far it travels.
+            source["candidate_offset"] = offset
+            source["candidate_baseline_value"] = baseline[offset]
+            source["candidate_max_value"] = data[offset]
+            source["candidate_deadline"] = time.monotonic() + self._PAD_CAPTURE_CONFIRM_S
+            return None
+
+        # Already tracking a candidate byte from an earlier call - keep
+        # observing it, ignoring any unrelated bytes moving elsewhere in
+        # the meantime (a stray stick nudge shouldn't restart the window).
+        value = data[candidate_offset] if candidate_offset < len(data) else source["candidate_baseline_value"]
+        source["candidate_max_value"] = max(source["candidate_max_value"], value)
+        if time.monotonic() < source["candidate_deadline"]:
+            return None
+        source["baseline"] = data
+        return self._finalize_pad_candidate(source)
+
+    def _scan_keyboard_capture(self, data):
+        for offset in range(0, len(data) - _EVDEV_EVENT_SIZE + 1, _EVDEV_EVENT_SIZE):
+            _sec, _usec, ev_type, code, value = struct.unpack(
+                _EVDEV_EVENT_FORMAT, data[offset : offset + _EVDEV_EVENT_SIZE]
+            )
+            if ev_type == _EVDEV_EV_KEY and value == 1:
+                return {"success": True, "key": f"kbd:{code}", "label": f"Key {code}"}
+        return None
+
+    def _scan_pad_evdev_capture(self, data, source):
+        # Digital-only fallback for a gamepad with no hidraw node - see
+        # _find_external_evdev_gamepads. No confirm-window/analog handling
+        # like _scan_pad_capture: a fresh EV_KEY press is unambiguous.
+        for offset in range(0, len(data) - _EVDEV_EVENT_SIZE + 1, _EVDEV_EVENT_SIZE):
+            _sec, _usec, ev_type, code, value = struct.unpack(
+                _EVDEV_EVENT_FORMAT, data[offset : offset + _EVDEV_EVENT_SIZE]
+            )
+            if ev_type == _EVDEV_EV_KEY and value == 1:
+                key = f"padev:{source['vendor']:04x}:{source['product']:04x}:{code}"
+                return {"success": True, "key": key, "label": f"Button {code} ({source['name']})"}
+        return None
+
+    def _capture_input_signal_once(self, timeout=6.0):
+        sources = []
+        built_in_path = self._find_steamdeck_hidraw()
+        if built_in_path:
+            fd = self._open_nonblocking(built_in_path)
+            if fd is not None:
+                sources.append({"kind": "built_in", "fd": fd})
+        for candidate in self._find_external_hidraw_gamepads():
+            fd = self._open_nonblocking(candidate["path"])
+            if fd is not None:
+                sources.append({"kind": "pad", "fd": fd, "vendor": candidate["vendor"], "product": candidate["product"], "name": candidate["name"]})
+        # Fallback for gamepads with no hidraw node at all (confirmed live
+        # 2026-08-20: a USB Xbox controller bound to the `xpad` kernel
+        # driver never gets one, unlike the same controller family over
+        # Bluetooth via hid-generic) - digital buttons only via evdev, no
+        # analog triggers, since this path doesn't get the same protection
+        # from gamescope's overlay-input-routing that hidraw does and is a
+        # "better than nothing" fallback, not a first-class path.
+        for candidate in self._find_external_evdev_gamepads():
+            fd = self._open_nonblocking(candidate["path"])
+            if fd is not None:
+                sources.append({"kind": "padev", "fd": fd, "vendor": candidate["vendor"], "product": candidate["product"], "name": candidate["name"]})
+        for path in self._find_keyboards(force_rescan=True):
+            fd = self._open_nonblocking(path)
+            if fd is not None:
+                sources.append({"kind": "kbd", "fd": fd})
+
+        if not sources:
+            return {"success": False, "error": "no input devices found"}
+
+        by_fd = {s["fd"]: s for s in sources}
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                # Bounded well below the remaining overall timeout so the
+                # loop wakes up periodically even with no new data - a
+                # candidate pad byte (see _scan_pad_capture/_finalize_pad_
+                # candidate) needs its confirmation deadline checked even if
+                # the device stops sending reports once its value settles
+                # (e.g. a trigger held steady at full depth), not only when
+                # a fresh report happens to arrive.
+                wait = min(0.1, max(0.0, deadline - time.monotonic()))
+                readable, _, _ = select.select(list(by_fd), [], [], wait)
+                for fd in readable:
+                    source = by_fd[fd]
+                    try:
+                        data = os.read(fd, 4096)
+                    except OSError:
+                        continue
+                    if not data:
+                        continue
+                    if source["kind"] == "kbd":
+                        result = self._scan_keyboard_capture(data)
+                    elif source["kind"] == "built_in":
+                        result = self._scan_builtin_capture(data)
+                    elif source["kind"] == "padev":
+                        result = self._scan_pad_evdev_capture(data, source)
+                    else:
+                        result = self._scan_pad_capture(data, source)
+                    if result:
+                        return result
+                now = time.monotonic()
+                for source in by_fd.values():
+                    if source.get("kind") == "pad" and now >= source.get("candidate_deadline", float("inf")):
+                        result = self._finalize_pad_candidate(source)
+                        if result:
+                            return result
+            return {"success": False, "error": "timeout"}
+        finally:
+            for fd in by_fd:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    async def capture_input_signal(self, timeout=6.0):
+        return await asyncio.to_thread(self._capture_input_signal_once, timeout)
 
     async def translate_latest(self):
         if self.translation_in_progress:

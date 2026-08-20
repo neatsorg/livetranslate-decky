@@ -160,3 +160,47 @@ not enough to run out of the box - the following has to be in place first.
 Nothing above is needed for the Chrome Screen AI OCR model itself - that
 ~120MB download is fetched on demand by the plugin at runtime (see
 `bin/screenai_downloader.py`) once the user clicks "Download" in QAM.
+
+## Running on a non-Deck Linux host
+
+Everything above is written with SteamOS/Deck in mind. Keybindings (an
+external gamepad or a keyboard, captured via `main.py`'s `capture_input_signal`)
+have extra caveats on a generic desktop Linux + Decky Loader setup, confirmed
+live on a CachyOS box:
+
+- **Decky Loader runs each plugin's backend as an unprivileged user, with no
+  supplementary groups at all** (confirmed via `/proc/<pid>/status` showing an
+  empty `Groups:` line even after adding the user to `input`) - so the usual
+  fix of adding the user to the `input` group does **not** work here, and
+  `/dev/hidraw*`/`/dev/input/event*` stay unreadable by default (`Permission
+  denied`, errno 13) for anything other keyboards/gamepads than SteamOS's own
+  udev rules already cover. The workaround is a permissive udev rule:
+  ```bash
+  printf '%s\n%s\n' \
+    'SUBSYSTEM=="hidraw", MODE="0666"' \
+    'SUBSYSTEM=="input", KERNEL=="event*", MODE="0666"' \
+    | sudo tee /etc/udev/rules.d/99-livetranslate-hidraw.rules
+  sudo udevadm control --reload
+  sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input
+  sudo systemctl restart plugin_loader
+  ```
+  This makes those devices world-readable/writable on the host, which is a
+  real (if fairly standard for single-user desktops) permission relaxation -
+  understand that tradeoff before applying it on a shared/multi-user machine.
+- **A USB gamepad bound to the `xpad` kernel driver never gets a hidraw node
+  at all** (confirmed with a wired Xbox Series S|X controller) - only
+  Bluetooth-connected pads via `hid-generic`/`hid-microsoft` do. Keybindings
+  falls back to reading such a pad via plain evdev in that case, but that
+  path only supports digital buttons - no analog triggers (L2/R2-style).
+- **Closing an overlay (QAM, or this plugin's own Keybindings/RoiCrop
+  modal/Tap Translate mode) can leave the underlying game unable to receive
+  gamepad input at all**, until the game window is clicked with a mouse.
+  Confirmed live only on a desktop Linux host running gamescope directly
+  (`gamescope --backend drm -- steam -tenfoot`), not on a real Deck. The
+  plugin makes a best-effort explicit call
+  (`SteamClient.Overlay.SetOverlayState(appid, Hidden)`, see
+  `src/Composition.tsx`'s `forceOverlayHidden`) when its own overlays close
+  and when QAM is detected closing, but this did **not** resolve the issue in
+  testing - it looks like a Decky Loader/gamescope interaction outside what
+  this plugin can reliably control from its own JS context. No fix yet;
+  clicking into the game window with a mouse is the current workaround.
