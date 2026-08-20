@@ -5,9 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "rollup -c",
-    "watch": "rollup -c -w",
-    "package": "bash scripts/package_plugin.sh",
-    "release": "pnpm run build && pnpm run package"
+    "watch": "rollup -c -w"
   },
   "license": "MIT",
   "devDependencies": {

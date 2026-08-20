@@ -1,180 +1,143 @@
-# PlayTranslate Decky Plugin (LiveTranslator-kun)
+# LiveTranslator-kun
 
-Decky Loader plugin that captures the screen through Gamescope/PipeWire, runs
-OCR on it, and overlays a live translation - built for game subtitles on
-Steam Deck.
+A [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin
+that captures the screen through Gamescope/PipeWire, recognizes text with
+OCR, and overlays the translation in real time.
+
+It's built primarily for translating game subtitles on Steam Deck, but most
+of its features also work on a standard Linux setup. Currently, only
+English-to-Japanese translation is supported.
 
 ## Features
 
-- **Dynamic Capture** (default): full-frame text discovery and tracking, using
-  on-device Chrome Screen AI OCR (Tesseract kept as a debug fallback engine).
-  Supports both wide discovery and a single fixed-region crop mode.
-- **Legacy fixed-region capture** (`capture.py`): the original per-game
-  calibrated-ROI mode, still available and mutually exclusive with Dynamic
-  Capture. Not yet fully superseded.
-- **Multi-engine translation**: Ollama (local), Gemini, Google Translate,
-  Google Cloud Translate, DeepL - with an LRU translation cache.
-- **Tap-to-translate**: L4+L2 hold + touchscreen long-press, while paused.
-- **Configurable keybindings** for refresh / pause-resume / touch-translate.
-- QAM sidebar organized into Capture Control / Settings / Other Settings.
+- **Real-time auto-translation** - Automatically detects text shown on the
+  game screen and displays the translation at the source text's position. It
+  keeps tracking and re-translating as the text moves, the screen scrolls, or
+  the screen itself changes. You can refresh the screen to re-translate, or
+  pause translation temporarily.
+- **Region capture mode** - Restrict auto-translation to a specific area of
+  the screen, such as a game's subtitle box.
+- **Screen-tap translation** - While real-time auto-translation is paused,
+  translate only the text at the spot you tap on screen.
+- **Recent cache** - When the same line of text appears repeatedly, show the
+  cached result instantly instead of re-running OCR and translation.
 
-## Layout
+## Customization
 
-This is now a single self-contained folder:
+- **Multiple translation engines** - choose between Google Cloud Translate,
+  DeepL, Gemini AI, Google Translate, or an AI model via Ollama.
+- **Keybindings** - for screen refresh, pause/resume, and tap-translate.
+  Each action can be bound to Steam Deck's own controls, a gamepad, or a
+  keyboard, and each binding supports long-press and multi-key combos.
+- **Legacy OCR** - a TesseractOCR-based engine, built early in development,
+  is still available as a fallback. It's unlikely to see active maintenance
+  going forward, and using it naturally requires TesseractOCR itself.
 
-```text
-livetranslate-decky/
-  plugin.json
-  main.py           # Decky plugin backend
-  src/index.tsx      # frontend
-  bin/                # capture/OCR/translation engine (see bin/README.md)
-    capture.py
-    capture_dynamic.py
-    providers/
-    ...
-```
+## Requirements
 
-`main.py`'s `_candidate_engine_dirs()` looks for the engine in:
+- Steam Deck (SteamOS) - experimental support on other gamescope-based Linux
+  handhelds/desktops, see [Running on a non-Deck Linux host](#running-on-a-non-deck-linux-host)
+- [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) installed
+- distrobox + podman, for the OCR/translation engine container (installed
+  automatically - see [Setup](#setup) below)
+- Internet connection for the on-device OCR model's one-time download, and
+  for any of the cloud translation engines
 
-1. `PLAYTRANSLATE_ENGINE_DIR` (dev-only override, points at an out-of-tree
-   engine checkout)
-2. `bin/` inside this plugin (the shipped location)
+## Installation
 
-## Build
+1. Install [Decky Loader](https://decky.xyz) on your Steam Deck if you
+   haven't already - see the [official install
+   guide](https://deckyloader.org/guide/how-to-install-decky-loader-steam-deck)
+   for details.
+2. [Click here to download the latest version.](../../releases/latest)
+3. In Steam's Quick Access Menu, press the plug icon to open the Decky
+   Loader settings you installed in step 1.
+4. In Decky Loader's settings, select **General** from the left-hand menu,
+   then enable the **Developer Mode** toggle near the bottom.
+5. New menu items ("Plugins", "Developer", "Testing", etc.) will appear.
+   Choose **Developer**, then press the **ZIP file** button and open the
+   file you downloaded to install it - or press the **URL** button and
+   paste the URL of the latest zip instead.
 
-```bash
-corepack enable
-corepack prepare pnpm@latest --activate
-pnpm install
-pnpm run build
-```
+## Setup
 
-Copy the plugin folder to the Steam Deck's Decky plugin directory after build.
-The Deck does not need Node.js or pnpm to run the built plugin.
+The plugin runs its OCR/translation engine inside a small container, which
+needs a one-time setup:
 
-For an existing Deck install, `../deploy/deploy_to_deck.sh` syncs a build
-over SSH instead - see that script for details.
+1. From the plugin's menu, press **OCR Settings**.
+2. On the screen that opens, press **Set Up OCR Environment**. This
+   installs distrobox/podman if missing, creates the container, and installs
+   the Python packages the engine needs. If a step fails (a temporary
+   network issue, for example), it's safe to press again - it resumes from
+   where it left off. The setup log is shown live while it runs. Once the
+   small labels above the button read `distrobox:installed` and
+   `container:created`, setup is complete.
+3. The default OCR engine (Chrome Screen AI) still needs to be downloaded.
+   Press **Download** at the bottom of the same screen. Once the label above
+   the button reads `Installed`, it's ready.
 
-## Packaging as a distributable zip
+Optional, only if you plan to use them:
 
-Decky Loader installs a plugin from a zip containing one top-level folder
-with these files inside it:
+- **A cloud API key**, if you use Gemini AI, Google Cloud Translate, or
+  DeepL. Press **Translation Settings** in the plugin's menu to open the
+  engine-selection screen - paid engines generally require an API key,
+  entered there.
+- **Ollama**, if you set the translation engine to Ollama - point it at a
+  local or LAN Ollama server. The plugin itself doesn't install or run
+  Ollama.
 
-```text
-<plugin-folder>/
-  plugin.json     # required
-  package.json    # required
-  dist/index.js   # required - built frontend
-  main.py         # required - this plugin uses the Python backend
-  bin/            # optional - this plugin's engine scripts
-  LICENSE         # required if the license needs it included (MIT does)
-  README.md       # optional but recommended
-```
+## How to use
 
-```bash
-pnpm run release   # build the frontend, then package
-# or, if dist/ is already built:
-pnpm run package
-```
+1. Press **Start Capture** on the plugin's settings screen to begin
+   real-time translation.
+2. Your configured keybinding refreshes the subtitle (default: L4) or
+   toggles pause/resume (default: hold L4).
+3. While paused, hold the tap-translate key (default: L4+L2) and long-press
+   the screen to show only the translation for the text at that spot, at the
+   bottom of the screen.
+4. Change keybindings via the **Key Bindings** button on the settings
+   screen.
+5. Press **Stop Capture** to end real-time translation. The plugin doesn't
+   try to detect whether you're actually in a game before translating, so
+   pause it or press **Stop Capture** whenever you don't need translation.
 
-produces `out/livetranslate-decky-<version>.zip`, ready to sideload.
+### Region Capture Mode
 
-This uses `scripts/package_plugin.sh`, not the official [Decky
-CLI](https://github.com/SteamDeckHomebrew/cli)'s `decky plugin build`. That
-CLI's build subcommand always runs inside a docker/podman container (it's
-built for plugins with a compiled `backend/` tree) - this plugin has nothing
-to compile (`main.py` is plain Python), and a container engine isn't
-guaranteed to be available wherever this gets packaged from, so the script
-just assembles the structure directly instead. Verified against the layout
-documented in
-[decky-plugin-template](https://github.com/SteamDeckHomebrew/decky-plugin-template).
+1. Instead of **Start Capture**, click **Start Region Mode** to start
+   auto-translation limited to a specific area of the screen. Useful for
+   games where subtitles always appear in the same place, or when
+   translating the whole screen is more distracting than helpful.
+2. Configure the region to translate via the **Region Mode Config** button
+   on the settings screen.
 
-To sideload the zip on the Deck (or any Decky Loader install) for testing:
-QAM -> Decky's own settings (gear icon) -> enable **Developer Mode** ->
-Developer tab -> **Install Plugin from Zip**.
+## Troubleshooting
 
-**Still open, not needed for a zip-only test install:**
+**Nothing is detected / translation never appears**
+Check that the Capture Control area on the settings screen shows "running".
+If the OCR environment hasn't been set up yet, the OCR tab will say so - see
+[Setup](#setup) above.
 
-- `plugin.json`'s `publish` block has no `image` - only needed if this ever
-  goes through the plugin store or a plugin-browser URL.
-- No CI - `pnpm run release` is a local/manual step for now.
+**A translation engine says the API key is wrong**
+Check that the key for that provider was copied correctly into the settings
+screen. Gemini, Google Cloud Translate, and DeepL each use their own
+separate key.
 
-## Prerequisites (must be set up before the plugin works)
+**OCR Environment setup fails partway through**
+Press **Set Up OCR Environment** again - it's idempotent and will pick up
+where it left off. If it keeps failing, check the setup log shown in the OCR
+tab for the actual error.
 
-Unlike `Decky-Translator` (which bundles all its OCR/translation
-dependencies as portable Python wheels + a relocatable Python runtime
-downloaded via `package.json`'s `remote_binary`), this plugin runs its
-OCR/translation engine **inside a distrobox container**. The zip alone is
-not enough to run out of the box - the following has to be in place first.
+### Running on a non-Deck Linux host
 
-1. **distrobox + podman, and a container named `playtranslate-ocr`.**
-   `main.py` always launches `bin/ocr_worker.py` inside a container with
-   this exact name (override via the `PLAYTRANSLATE_OCR_BOX` env var) -
-   this is required even when the OCR engine is the default Chrome Screen
-   AI, not just for the Tesseract fallback.
+The plugin is built and tested against SteamOS/Deck, but has also been
+confirmed working on a non-Deck Linux host (gamescope + Decky Loader on
+CachyOS), with a few caveats around gamepad/keyboard input:
 
-   **This step is now automated**: open the OCR tab in QAM and press
-   **Set Up OCR Environment** (backed by `get_ocr_container_status` /
-   `provision_ocr_container` in `main.py`, running
-   `bin/setup_ocr_container.sh`). It installs distrobox+podman to
-   `~/.local` if missing, creates the `playtranslate-ocr` container
-   (Ubuntu 24.04 by default, override with `PLAYTRANSLATE_OCR_IMAGE`) if
-   missing, and installs `Pillow`/`protobuf` into it either way. It's
-   idempotent, so re-pressing the button after a failure (e.g. a flaky
-   download) is safe. The QAM panel polls status every 2s and shows a
-   tail of the setup log.
-
-   To do the same thing by hand instead (e.g. over SSH, for debugging):
-   ```bash
-   PLAYTRANSLATE_OCR_BOX=playtranslate-ocr bash bin/setup_ocr_container.sh
-   ```
-
-   Only needed for the Tesseract debug fallback engine (`ocr_settings.engine
-   = "tesseract"`), on top of the above - not handled by the automated
-   setup, since it's not needed by the default engine:
-   ```bash
-   distrobox enter playtranslate-ocr -- sudo apt-get install -y tesseract-ocr
-   distrobox enter playtranslate-ocr -- pip install --user tesserocr
-   ```
-
-2. **GStreamer + PyGObject on the host**, not in distrobox - `capture.py`
-   and `capture_dynamic.py` run directly under the Decky-managed Python and
-   import `gi.repository.Gst` plus the `pipewiresrc`/`videocrop`/`appsink`
-   GStreamer elements. Stock SteamOS ships these already (gamescope itself
-   uses PipeWire/GStreamer), so this is normally a non-issue there - verify
-   with the commands in [bin/README.md](bin/README.md#steam-deck-dependencies)
-   rather than assuming, especially on a non-SteamOS Deck-like distro
-   (Bazzite, etc.).
-
-3. **`gamescopectl`** on `PATH` - used for the ROI-crop screenshot feature.
-   Ships with gamescope; present on stock SteamOS.
-
-4. **Ollama** (optional) - only if the translation engine is set to
-   "Ollama" in QAM settings. The plugin does not install or run Ollama
-   itself; point it at a local or LAN Ollama server.
-
-5. **A cloud translation API key** (optional) - only if using Gemini,
-   Google Cloud Translate, or DeepL. Entered directly in the QAM settings
-   panel, not a file to install.
-
-Nothing above is needed for the Chrome Screen AI OCR model itself - that
-~120MB download is fetched on demand by the plugin at runtime (see
-`bin/screenai_downloader.py`) once the user clicks "Download" in QAM.
-
-## Running on a non-Deck Linux host
-
-Everything above is written with SteamOS/Deck in mind. Keybindings (an
-external gamepad or a keyboard, captured via `main.py`'s `capture_input_signal`)
-have extra caveats on a generic desktop Linux + Decky Loader setup, confirmed
-live on a CachyOS box:
-
-- **Decky Loader runs each plugin's backend as an unprivileged user, with no
-  supplementary groups at all** (confirmed via `/proc/<pid>/status` showing an
-  empty `Groups:` line even after adding the user to `input`) - so the usual
-  fix of adding the user to the `input` group does **not** work here, and
-  `/dev/hidraw*`/`/dev/input/event*` stay unreadable by default (`Permission
-  denied`, errno 13) for anything other keyboards/gamepads than SteamOS's own
-  udev rules already cover. The workaround is a permissive udev rule:
+- **Decky Loader runs each plugin's backend as an unprivileged user with no
+  supplementary groups**, so `/dev/hidraw*`/`/dev/input/event*` may stay
+  unreadable even after adding your user to the `input` group. If
+  keybindings don't detect your controller/keyboard, add a permissive udev
+  rule:
   ```bash
   printf '%s\n%s\n' \
     'SUBSYSTEM=="hidraw", MODE="0666"' \
@@ -184,23 +147,65 @@ live on a CachyOS box:
   sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input
   sudo systemctl restart plugin_loader
   ```
-  This makes those devices world-readable/writable on the host, which is a
-  real (if fairly standard for single-user desktops) permission relaxation -
-  understand that tradeoff before applying it on a shared/multi-user machine.
-- **A USB gamepad bound to the `xpad` kernel driver never gets a hidraw node
-  at all** (confirmed with a wired Xbox Series S|X controller) - only
-  Bluetooth-connected pads via `hid-generic`/`hid-microsoft` do. Keybindings
-  falls back to reading such a pad via plain evdev in that case, but that
-  path only supports digital buttons - no analog triggers (L2/R2-style).
-- **Closing an overlay (QAM, or this plugin's own Keybindings/RoiCrop
-  modal/Tap Translate mode) can leave the underlying game unable to receive
-  gamepad input at all**, until the game window is clicked with a mouse.
-  Confirmed live only on a desktop Linux host running gamescope directly
-  (`gamescope --backend drm -- steam -tenfoot`), not on a real Deck. The
-  plugin makes a best-effort explicit call
-  (`SteamClient.Overlay.SetOverlayState(appid, Hidden)`, see
-  `src/Composition.tsx`'s `forceOverlayHidden`) when its own overlays close
-  and when QAM is detected closing, but this did **not** resolve the issue in
-  testing - it looks like a Decky Loader/gamescope interaction outside what
-  this plugin can reliably control from its own JS context. No fix yet;
-  clicking into the game window with a mouse is the current workaround.
+  This makes those devices world-readable/writable on the host - a
+  reasonable tradeoff on a single-user desktop, but worth knowing about on a
+  shared machine.
+- **A USB gamepad bound to the `xpad` kernel driver** (most wired Xbox
+  controllers) doesn't expose a hidraw node, so keybindings fall back to
+  plain evdev for those - digital buttons only, no analog triggers.
+- **Closing an overlay (this plugin's own settings screen) can leave the
+  game unable to receive gamepad input** until you click into the game
+  window with a mouse. This has only been seen on a desktop Linux host
+  running gamescope directly, not on a real Deck; there's no fix from the
+  plugin's side yet.
+
+## Development
+
+See [docs/BUILDING.md](docs/BUILDING.md) for building from source.
+
+## Support
+
+I have no idea how much this will actually get used, so I'm not sure how
+many bug reports, support requests, or feature requests to expect. But if
+something comes up, please open an [issue](../../issues).
+
+You can also support development via [Ko-fi](https://ko-fi.com/neatsorg).
+
+## Features Planned If Development Continues
+
+- **Pause the game and translate a selected rectangle** - in a sense, a
+  throwback feature. Aiming for PCOT.
+- **Multi-language support** - add Japanese-to-English translation
+  alongside the current English-to-Japanese, then expand the source/target
+  language options further.
+- **Windows port** - low priority, since I'm generally in the "if you're
+  gaming, use Linux" camp - but Windows.Media.Ocr is impressive, so maybe
+  someday.
+- **Support beyond games** - seems fairly feasible. Live-translating video
+  subtitles, though, isn't realistic at the current speed.
+
+## Likely FAQ
+
+- **Can you support game XXXXX?** This isn't a tool that adds per-game
+  support, so no. If the same kind of issue shows up across multiple games,
+  though, I'll look into it.
+- **Translation quality is weak.** Right now this tool hands off both OCR
+  and translation entirely to external engines, so quality mostly depends on
+  those getting better over time.
+- **Translation is slow.** There's still room to speed things up. If
+  development continues, this is something I'd likely work on.
+- **Please port it to Mac.** The relative benefit feels small, so I'm not
+  very interested.
+- **Please add speech translation.** The overhead would be significant, so
+  I'm not very interested - though I might try it if a strong enough
+  external API shows up.
+- **It doesn't work.** If you describe your environment, the game, and the
+  situation in a lot of detail, I might be able to figure it out - but I
+  can't promise anything. And the more unusual your setup, the harder it
+  gets.
+- **How do I open the Quick Access Menu with a gamepad?** Home button + A
+  (for an Xbox-style button layout). On a keyboard, it's Ctrl+2.
+
+## License
+
+[MIT](LICENSE)

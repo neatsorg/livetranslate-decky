@@ -6,12 +6,13 @@ standalone Python scripts (not a package) launched as subprocesses by
 `main.py`, and can also be run and tested directly on a Steam Deck as
 described below.
 
-This README documents `capture.py`, the legacy fixed-region capture path
+This README documents `capture.py`, the original fixed-region capture path
 that receives Gamescope frames through PipeWire and crops a region with
-GStreamer. `capture_dynamic.py` (the default Dynamic Capture engine) reuses
-the same PipeWire/GStreamer plumbing but adds full-frame text discovery,
-OCR, and translation on top - see `PHASE_A_HANDOFF.md` in the repo root
-for its design history.
+GStreamer. Its backend hooks (`start_capture`/`stop_capture` in `main.py`)
+still work, but the plugin UI no longer calls them - Dynamic Capture
+(`capture_dynamic.py`) is the only mode reachable from QAM. `capture_dynamic.py`
+reuses the same PipeWire/GStreamer plumbing but adds full-frame text
+discovery, OCR, and translation on top.
 
 ## Assumptions Already Confirmed
 
