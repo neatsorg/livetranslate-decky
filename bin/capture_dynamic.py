@@ -57,8 +57,8 @@ from gi.repository import Gst
 from region_tracker import MultiRegionTracker
 
 # Cap on simultaneous /translate calls fired from a single discovery batch.
-# Live-measured on aegis's RTX 2070 SUPER (8GB, translategemma Q4_K_M ~2.7GB
-# resident): 8 concurrent calls finished in ~4.3s wall-clock vs. ~8.4s
+# Live-measured on a dev LAN server (RTX 2070 SUPER 8GB, translategemma
+# Q4_K_M ~2.7GB resident): 8 concurrent calls finished in ~4.3s wall-clock vs. ~8.4s
 # serial, no errors or GPU OOM. Capped rather than uncapped (len(added) could
 # in principle exceed this on a very text-dense frame) so a pathological
 # discovery result can't fire dozens of simultaneous requests at the backend.
@@ -562,7 +562,7 @@ class DynamicCaptureRunner:
                 t_translate_batch_start = time.monotonic()
                 # Parallel, not the old one-at-a-time loop: translate_stub.
                 # post_http() is a blocking HTTP call, and live-measured
-                # concurrency testing against aegis's Ollama backend showed
+                # concurrency testing against a dev LAN Ollama backend showed
                 # ~1.7-2x wall-clock speedup at 3-8 simultaneous calls with
                 # no errors (see DISCOVERY_TRANSLATE_MAX_WORKERS). This is
                 # what actually mattered for the "feels heavier" complaint -
@@ -1121,7 +1121,7 @@ def main():
         "every measured session. Cut to 0.0 for now as a deliberate tradeoff, not a settled fix - see PHASE_A_HANDOFF.md's 2026-08-19 section for the "
         "measurements and the residual risk if CloseSideMenus() ever silently stops working.",
     )
-    parser.add_argument("--translate-url", default="http://192.168.1.32:8787/translate", help="Translation HTTP endpoint.")
+    parser.add_argument("--translate-url", default="http://127.0.0.1:8787/translate", help="Translation HTTP endpoint.")
     parser.add_argument("--target-lang", default="Japanese")
     parser.add_argument("--source-lang", default="English")
     parser.add_argument(

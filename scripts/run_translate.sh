@@ -8,7 +8,7 @@ TRANSLATE_URL="${PLAYTRANSLATE_TRANSLATE_URL:-}"
 if [[ -z "${TRANSLATE_URL}" && -f "${DATA_DIR}/translate_url.txt" ]]; then
   TRANSLATE_URL="$(tr -d '[:space:]' < "${DATA_DIR}/translate_url.txt")"
 fi
-TRANSLATE_URL="${TRANSLATE_URL:-http://192.168.1.32:8787/translate}"
+TRANSLATE_URL="${TRANSLATE_URL:-http://127.0.0.1:8787/translate}"
 if [[ "${TRANSLATE_URL}" =~ ^https?://[^/]+/?$ ]]; then
   TRANSLATE_URL="${TRANSLATE_URL%/}/translate"
 fi

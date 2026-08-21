@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Falls back through common Linux system CA bundle locations rather than
 # trusting Python's implicit default-path lookup - confirmed necessary on a
-# real Decky Loader deployment (aegis, 2026-08-19): the plugin backend
+# real Decky Loader deployment (a dev LAN server, 2026-08-19): the plugin backend
 # process (spawned by Decky's privileged parent, not an interactive shell)
 # hit "unable to get local issuer certificate" even though the exact same
 # interpreter run directly on the same machine, and the CA bundle file
@@ -58,7 +58,7 @@ def _ssl_context() -> ssl.SSLContext:
 _SSL_CONTEXT = _ssl_context()
 
 # CIPD's Linux build of this package is x86_64-only, which covers both the
-# Steam Deck (Zen2) and the dev/aegis boxes this project runs on.
+# Steam Deck (Zen2) and the dev LAN boxes this project runs on.
 CIPD_PACKAGE = "chromium/third_party/screen-ai/linux"
 CIPD_VERSION = "latest"  # tracks Chrome Stable; pin to a hexdigest to freeze
 CIPD_HOST = "https://chrome-infra-packages.appspot.com"

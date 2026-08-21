@@ -456,7 +456,7 @@ class Plugin:
             configured = self._read_text_file(self.translate_url_path)
             if configured:
                 return self._normalize_translate_url(configured)
-        return "http://192.168.1.32:8787/translate"
+        return "http://127.0.0.1:8787/translate"
 
     def _load_translation_settings(self):
         if not self.translation_settings_path.exists():
