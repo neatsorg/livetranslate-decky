@@ -14,6 +14,8 @@ This project is developed with AI-assisted coding. I don't believe any code
 was copied from elsewhere, but if that's a concern for you, please refrain
 from using it.
 
+[Video Demo](https://www.youtube.com/watch?v=wTeWC3wXl9k)
+
 ## Features
 
 - **Real-time auto-translation** - Automatically detects text shown on the
