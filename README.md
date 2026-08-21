@@ -10,6 +10,10 @@ It's built primarily for translating game subtitles on Steam Deck, but most
 of its features also work on a standard Linux setup. Currently, only
 English-to-Japanese translation is supported.
 
+This project is developed with AI-assisted coding. I don't believe any code
+was copied from elsewhere, but if that's a concern for you, please refrain
+from using it.
+
 ## Features
 
 - **Real-time auto-translation** - Automatically detects text shown on the
@@ -83,7 +87,8 @@ Optional, only if you plan to use them:
 - **A cloud API key**, if you use Gemini AI, Google Cloud Translate, or
   DeepL. Press **Translation Settings** in the plugin's menu to open the
   engine-selection screen - paid engines generally require an API key,
-  entered there.
+  entered there. As the author, I'd personally recommend Google Cloud
+  Translate the most.
 - **Ollama**, if you set the translation engine to Ollama - point it at a
   local or LAN Ollama server. The plugin itself doesn't install or run
   Ollama.
@@ -135,6 +140,19 @@ The plugin is built and tested against SteamOS/Deck, but has also been
 confirmed working on a non-Deck Linux host (gamescope + Decky Loader on
 CachyOS), with a few caveats around gamepad/keyboard input:
 
+- **gamescope is required**, to get an environment equivalent to Steam
+  Deck's. It's a Wayland micro-compositor developed by Valve, with a rich
+  set of features tuned for gaming, used on Steam Deck and on Linux desktops
+  running gaming-focused OSes like SteamOS. Running Steam through gamescope
+  and having it output to PipeWire is what lets this plugin capture the
+  game's video as a stream in the first place - which is genuinely
+  impressive. gamescope also has MangoHud's overlay functionality built in,
+  and using that to show subtitles was actually the original idea behind
+  this plugin. Installation depends on your distribution - on Arch-based
+  systems (the same family as SteamOS), this usually works:
+  ```bash
+  sudo pacman -S gamescope
+  ```
 - **Decky Loader runs each plugin's backend as an unprivileged user with no
   supplementary groups**, so `/dev/hidraw*`/`/dev/input/event*` may stay
   unreadable even after adding your user to the `input` group. If
@@ -160,6 +178,20 @@ CachyOS), with a few caveats around gamepad/keyboard input:
   window with a mouse. This has only been seen on a desktop Linux host
   running gamescope directly, not on a real Deck; there's no fix from the
   plugin's side yet.
+- **Screen-tap translation doesn't work.** Pressing the tap-translate key
+  and then clicking the screen sometimes shows no translation, and
+  afterward the game window won't regain focus until you click it with the
+  mouse. This is likely tied to the overlay-focus issue above.
+- **Running gamescope nested inside a Wayland compositor can cause issues
+  with gamepad input and overlay display.** gamescope can run nested on top
+  of an existing display server/desktop environment, but this can't be
+  guaranteed not to cause problems with Decky Loader. My personal
+  recommendation is to run gamescope in embedded mode instead - i.e. select
+  gamescope as the session at your login screen, so the machine boots
+  straight into a dedicated full-screen Steam UI, Deck-style. This differs
+  from launching Steam from the desktop and switching to Big Picture mode:
+  with no other compositor running underneath, this setup is much less
+  prone to the issues above.
 
 ## Development
 
@@ -167,9 +199,10 @@ See [docs/BUILDING.md](docs/BUILDING.md) for building from source.
 
 ## Support
 
-I have no idea how much this will actually get used, so I'm not sure how
-many bug reports, support requests, or feature requests to expect. But if
-something comes up, please open an [issue](../../issues).
+I have no idea how much this will actually get used, so I don't know how
+many bug reports, support requests, or feature requests to expect - or
+whether I'll be able to address them. But if something comes up, please open
+an [issue](../../issues).
 
 You can also support development via [Ko-fi](https://ko-fi.com/neatsorg).
 
@@ -190,7 +223,7 @@ You can also support development via [Ko-fi](https://ko-fi.com/neatsorg).
 
 - **Can you support game XXXXX?** This isn't a tool that adds per-game
   support, so no. If the same kind of issue shows up across multiple games,
-  though, I'll look into it.
+  there's a chance I'll look into it.
 - **Translation quality is weak.** Right now this tool hands off both OCR
   and translation entirely to external engines, so quality mostly depends on
   those getting better over time.
@@ -208,6 +241,26 @@ You can also support development via [Ko-fi](https://ko-fi.com/neatsorg).
 - **How do I open the Quick Access Menu with a gamepad?** Home button + A
   (for an Xbox-style button layout). On a keyboard, it's Ctrl+2.
 
+## Acknowledgments
+
+- [Valve](https://www.valvesoftware.com/) - for the Steam Deck, a wonderful
+  piece of hardware, and for Gamescope. I share their philosophy.
+- [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) -
+  massively expanded what's possible on the Steam Deck. I share their
+  philosophy.
+- [Decky-Translator](https://github.com/cat-in-a-box/Decky-Translator) -
+  seeing what was possible with Decky Loader through this project genuinely
+  impressed me, and I leaned on its design a lot as a reference.
+- [PlayTranslate](https://github.com/dominostars/playtranslate) - watching
+  that gameplay video is what made me think "amazing, I want that too -
+  let's try something similar on Steam Deck!" That's why traces of the name
+  still show up in my code (function names and the like) - though of
+  course, no code was copied 😉. The original idea, though, belongs to this
+  person. Thanks for a great experience.
+- [Google](https://google.com/) - for Translate, the Gemini API, and more.
+- [Chromium Projects](https://www.chromium.org/) - Chrome Screen AI is
+  amazing.
+
 ## License
 
-[MIT](LICENSE)
+[GPLv3](LICENSE)

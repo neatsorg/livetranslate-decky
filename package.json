@@ -7,7 +7,7 @@
     "build": "rollup -c",
     "watch": "rollup -c -w"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",
