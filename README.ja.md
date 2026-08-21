@@ -47,7 +47,7 @@ AIコーディングを使用しています。他のコードを流用した部
 以下は必要な場合のみ:
 
 - **クラウドAPIキー**: Gemini AI、Google Cloud Translate、DeepLを使う場合。プラグインのメニューで**Translation Settings**ボタンを押すと、翻訳エンジンの選択画面が表示されます。有料のエンジンには、基本的にAPIキーが必要です。ここで入力します。なお、作者としてはGoogle Cloud Translateを最もおすすめします。
-- **Ollama**: 翻訳エンジンをOllamaに設定する場合。ローカルまたはLAN上のOllamaサーバーを指定してください。プラグイン自体はOllamaのインストールや起動は行いません。
+- **Ollama**: 翻訳エンジンをOllamaに設定する場合。ローカルまたはLAN上のOllamaサーバーを指定してください。プラグイン自体はOllamaのインストールや起動は行いません。なお、これを設定するUI欄はありません。プラグインのデータディレクトリ(Deck上では`~/homebrew/data/PlayTranslate/`)に`translate_url.txt`というファイルを作成し、サーバーの`http://host:port/translate`形式のURLを書き込むか、Steam起動前に`PLAYTRANSLATE_TRANSLATE_URL`環境変数を設定してください。どちらも未設定の場合は`http://127.0.0.1:8787/translate`が既定値として使われます。
 
 ## 使い方
 

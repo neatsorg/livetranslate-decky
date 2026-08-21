@@ -93,7 +93,12 @@ Optional, only if you plan to use them:
   Translate the most.
 - **Ollama**, if you set the translation engine to Ollama - point it at a
   local or LAN Ollama server. The plugin itself doesn't install or run
-  Ollama.
+  Ollama. There's no UI field for this: create a file named
+  `translate_url.txt` in the plugin's data directory
+  (`~/homebrew/data/PlayTranslate/` on a Deck) containing the server's
+  `http://host:port/translate` URL, or set the `PLAYTRANSLATE_TRANSLATE_URL`
+  environment variable before Steam starts. With neither set, it defaults to
+  `http://127.0.0.1:8787/translate`.
 
 ## How to use
 
