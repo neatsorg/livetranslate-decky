@@ -14,7 +14,7 @@ This project is developed with AI-assisted coding. I don't believe any code
 was copied from elsewhere, but if that's a concern for you, please refrain
 from using it.
 
-[Video Demo](https://www.youtube.com/watch?v=wTeWC3wXl9k)
+[Video Demo](https://www.youtube.com/watch?v=wTeWC3wXl9k) | [Download](../../releases/latest)
 
 ## Features
 

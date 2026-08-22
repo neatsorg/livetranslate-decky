@@ -6,7 +6,7 @@
 
 AIコーディングを使用しています。他のコードを流用した部分はないですが、気になさる方は使用をお控えいただければと思います。
 
-[Video Demo](https://www.youtube.com/watch?v=wTeWC3wXl9k)
+[Video Demo](https://www.youtube.com/watch?v=wTeWC3wXl9k) | [ダウンロード](../../releases/latest)
 
 ## 機能
 
