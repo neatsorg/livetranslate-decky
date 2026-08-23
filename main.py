@@ -7,6 +7,7 @@ import math
 import os
 import re
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -844,11 +845,35 @@ class Plugin:
         game_id = self._read_text_file(self._active_game_path())
         return game_id if self._valid_game_id(game_id) else _DEFAULT_GAME_ID
 
-    def _region_config_path(self, engine_dir, game_id):
+    # Per-game mutable configs (OCR regions, reference screenshots, dynamic
+    # ROI) live under data_dir, NOT the plugin install dir: Decky plugin dirs
+    # can be root-owned after a manual/sudo install ([Errno 13] on write) and
+    # are overwritten by every plugin update, silently dropping saved files.
+    # Bundled copies in bin/ stay as read-only fallbacks for first-run
+    # defaults and pre-migration saves.
+    def _game_settings_dir(self):
+        return self.data_dir / "game_settings"
+
+    def _saved_region_config_path(self, game_id):
+        return self._game_settings_dir() / f"ocr_regions.{game_id}.json"
+
+    def _saved_reference_image_path(self, game_id):
+        return self._game_settings_dir() / f"ocr_regions.{game_id}.reference.png"
+
+    def _saved_dynamic_roi_path(self, game_id):
+        return self._game_settings_dir() / f"dynamic_roi.{game_id}.json"
+
+    def _resolve_region_config_path(self, engine_dir, game_id):
+        """Region config to READ: the data-dir save wins over any bundled or
+        legacy copy sitting in the plugin's bin/. engine_dir may be None when
+        the engine was not found - saves still read fine from data-dir."""
+        saved = self._saved_region_config_path(game_id)
+        if saved.exists() or engine_dir is None:
+            return saved
         return engine_dir / f"ocr_regions.{game_id}.json"
 
     def _regions_json_path(self, engine_dir):
-        return self._region_config_path(engine_dir, self._get_active_game_id())
+        return self._resolve_region_config_path(engine_dir, self._get_active_game_id())
 
     async def get_active_game(self):
         return {"active": self._get_active_game_id()}
@@ -863,22 +888,26 @@ class Plugin:
 
     async def list_region_configs(self):
         engine_dir, _capture_py, _config_json = self._find_engine()
-        games = []
+        games = set()
+        settings_dir = self._game_settings_dir()
+        search_dirs = [settings_dir]
         if engine_dir:
-            for path in sorted(engine_dir.glob("ocr_regions.*.json")):
+            search_dirs.append(engine_dir)
+        for search_dir in search_dirs:
+            if not search_dir.is_dir():
+                continue
+            for path in sorted(search_dir.glob("ocr_regions.*.json")):
                 game_id = path.name[len("ocr_regions.") : -len(".json")]
                 if self._valid_game_id(game_id):
-                    games.append(game_id)
-        return {"games": games, "active": self._get_active_game_id()}
+                    games.add(game_id)
+        return {"games": sorted(games), "active": self._get_active_game_id()}
 
     async def get_region_config(self, game_id):
         game_id = str(game_id or "").strip()
         if not self._valid_game_id(game_id):
             return {"ok": False, "error": "invalid game id", "regions": []}
         engine_dir, _capture_py, _config_json = self._find_engine()
-        if not engine_dir:
-            return {"ok": False, "error": "engine directory was not found", "regions": []}
-        path = self._region_config_path(engine_dir, game_id)
+        path = self._resolve_region_config_path(engine_dir, game_id)
         if not path.exists():
             return {"ok": True, "regions": []}
         try:
@@ -888,7 +917,11 @@ class Plugin:
         regions = data.get("ocr_regions") if isinstance(data, dict) else data
         return {"ok": True, "regions": regions or []}
 
-    def _reference_image_path(self, engine_dir, game_id):
+    def _resolve_reference_image_path(self, engine_dir, game_id):
+        """Reference screenshot to READ: data-dir save first, bin/ fallback."""
+        saved = self._saved_reference_image_path(game_id)
+        if saved.exists() or engine_dir is None:
+            return saved
         return engine_dir / f"ocr_regions.{game_id}.reference.png"
 
     async def save_region_config(self, game_id, regions, reference_image_base64=None):
@@ -897,11 +930,12 @@ class Plugin:
             return {"ok": False, "error": "game id must be non-empty and use only letters, numbers, underscore"}
         if not isinstance(regions, list):
             return {"ok": False, "error": "regions must be a list"}
+        # Only needed for the legacy-reference carry-over below - saving
+        # itself never touches the plugin dir.
         engine_dir, _capture_py, _config_json = self._find_engine()
-        if not engine_dir:
-            return {"ok": False, "error": "engine directory was not found"}
-        path = self._region_config_path(engine_dir, game_id)
+        path = self._saved_region_config_path(game_id)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 json.dumps({"ocr_regions": regions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
@@ -913,12 +947,24 @@ class Plugin:
         # it's paired with the screenshot it was drawn against. A failure here
         # shouldn't fail the actual save, which is why regions are already
         # written and returned as ok above regardless of what happens next.
+        # Keep the regions/reference pair consistent in data-dir: without a
+        # fresh screenshot, carry over the previous one (bin/ fallback
+        # included) so a later re-edit never mixes new regions with an old
+        # image that no longer matches them.
         if reference_image_base64:
             try:
-                self._reference_image_path(engine_dir, game_id).write_bytes(
+                self._saved_reference_image_path(game_id).write_bytes(
                     base64.b64decode(reference_image_base64)
                 )
             except (OSError, ValueError):
+                pass
+        elif not self._saved_reference_image_path(game_id).exists():
+            try:
+                shutil.copyfile(
+                    self._resolve_reference_image_path(engine_dir, game_id),
+                    self._saved_reference_image_path(game_id),
+                )
+            except OSError:
                 pass
 
         return {"ok": True, "path": str(path)}
@@ -928,9 +974,7 @@ class Plugin:
         if not self._valid_game_id(game_id):
             return {"ok": False, "error": "invalid game id"}
         engine_dir, _capture_py, _config_json = self._find_engine()
-        if not engine_dir:
-            return {"ok": False, "error": "engine directory was not found"}
-        return self._read_image_base64(self._reference_image_path(engine_dir, game_id))
+        return self._read_image_base64(self._resolve_reference_image_path(engine_dir, game_id))
 
     def _read_image_base64(self, image_path):
         if not image_path.exists():
@@ -1091,7 +1135,12 @@ class Plugin:
             return {"ok": False, "error": "gamescopectl screenshot failed or timed out"}
         return self._read_image_base64(output_path)
 
-    def _dynamic_roi_path(self, engine_dir, game_id):
+    def _resolve_dynamic_roi_path(self, engine_dir, game_id):
+        """Dynamic-capture ROI to READ: data-dir save first, then any legacy
+        ROI left in the plugin's bin/ from before the storage move."""
+        saved = self._saved_dynamic_roi_path(game_id)
+        if saved.exists() or engine_dir is None:
+            return saved
         return engine_dir / f"dynamic_roi.{game_id}.json"
 
     def _valid_roi(self, roi):
@@ -1124,9 +1173,7 @@ class Plugin:
         if not self._valid_game_id(game_id):
             return {"ok": False, "error": "invalid game id", "roi": None}
         engine_dir, _capture_py, _config_json = self._find_engine()
-        if not engine_dir:
-            return {"ok": False, "error": "engine directory was not found", "roi": None}
-        path = self._dynamic_roi_path(engine_dir, game_id)
+        path = self._resolve_dynamic_roi_path(engine_dir, game_id)
         if not path.exists():
             return {"ok": True, "roi": None}
         try:
@@ -1145,11 +1192,9 @@ class Plugin:
         roi = self._normalize_roi(roi)
         if roi is None:
             return {"ok": False, "error": "roi must include numeric x_pct/y_pct/width_pct/height_pct"}
-        engine_dir, _capture_py, _config_json = self._find_engine()
-        if not engine_dir:
-            return {"ok": False, "error": "engine directory was not found"}
-        path = self._dynamic_roi_path(engine_dir, game_id)
+        path = self._saved_dynamic_roi_path(game_id)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"roi": roi}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         except OSError as exc:
             return {"ok": False, "error": str(exc)}
