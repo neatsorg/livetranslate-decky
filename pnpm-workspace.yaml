@@ -1,4 +1,0 @@
-peerDependencyRules:
-  ignoreMissing:
-    - react
-    - react-dom

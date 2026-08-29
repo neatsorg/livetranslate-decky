@@ -119,7 +119,6 @@ class SettingsDialog:
 
         ocr_row = QHBoxLayout()
         self.ocr_engine_combo = QComboBox()
-        self.ocr_engine_combo.addItem(t("settings.ocr_engine_screenai"), userData="screenai")
         self.ocr_engine_combo.addItem(t("settings.ocr_engine_windows_ocr"), userData="windows_ocr")
         ocr_row.addWidget(self.ocr_engine_combo)
         ocr_lang_button = QPushButton(t("settings.manage_ocr_languages"))
@@ -169,6 +168,15 @@ class SettingsDialog:
 
         dlg = OcrLanguageDialog()
         dlg.exec()
+        # Missing this call was a real bug (confirmed live 2026-08-29): a
+        # successful install writes "ocr_installed_locales" straight to
+        # settings.json from inside windows_ocr_lang.install(), same as
+        # Keybindings/ROI below - without resyncing self.settings here too,
+        # _on_accept()'s settings_store.save(self.settings) later wrote back
+        # this dialog's stale pre-install snapshot over that file, silently
+        # erasing the just-installed locale from the cache the instant
+        # Settings itself was closed with OK.
+        self._resync_settings_after_child_dialog()
 
     def _on_manage_keybindings(self):
         from keybindings_dialog import KeybindingsDialog
@@ -264,7 +272,7 @@ class SettingsDialog:
         self._refresh_window_title_choices()
         self.window_title_combo.setCurrentText(self.settings.get("capture", {}).get("window_title", ""))
 
-        ocr_idx = self.ocr_engine_combo.findData(self.settings.get("ocr_engine", "screenai"))
+        ocr_idx = self.ocr_engine_combo.findData(self.settings.get("ocr_engine", "windows_ocr"))
         self.ocr_engine_combo.setCurrentIndex(max(ocr_idx, 0))
         self.windows_ocr_lang_edit.setText(self.settings.get("windows_ocr_language", "en-US"))
 

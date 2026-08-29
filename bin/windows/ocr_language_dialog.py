@@ -1,6 +1,9 @@
-"""Small dialog for installing Windows' per-language OCR components
-(windows_ocr_lang.py) - one row per known locale, an install button that
-triggers a real UAC prompt for the user to approve themselves.
+"""Small dialog for installing/removing Windows' per-language OCR components
+(windows_ocr_lang.py) - one row per known locale, a single button per row
+that reads Install or Remove depending on current state and triggers a real
+UAC prompt for the user to approve themselves either way. One button rather
+than two side by side, to keep the dialog narrow - only one of the two
+actions ever makes sense for a given row at a time anyway.
 
 Standalone-runnable: `python ocr_language_dialog.py`.
 """
@@ -18,13 +21,13 @@ import windows_ocr_lang
 from i18n import t
 
 
-_ACTIVE_WORKERS = []  # see _InstallWorker.start()
+_ACTIVE_WORKERS = []  # see _ActionWorker.start()
 
 
-class _InstallWorker:
-    """Runs windows_ocr_lang.install() (which blocks on the elevated
-    process, up to several minutes) on a QThread so the UAC prompt and
-    download don't freeze this dialog.
+class _ActionWorker:
+    """Runs windows_ocr_lang.install() or .uninstall() (either blocks on an
+    elevated process, up to several minutes) on a QThread so the UAC prompt
+    and download/removal don't freeze this dialog.
 
     Routes through a Relay QObject rather than connecting straight to
     on_finished - see keybindings_dialog.py's _CaptureWorker (identical
@@ -38,14 +41,14 @@ class _InstallWorker:
     relay.fire -> on_finished then only ever fires once already on the main
     thread, so that second connection is safely same-thread regardless."""
 
-    def __init__(self, locale):
+    def __init__(self, action_fn, locale):
         from PySide6.QtCore import QObject, QThread, Signal
 
         class Worker(QObject):
             finished = Signal(bool, str)
 
             def run(self):
-                ok, message = windows_ocr_lang.install(locale)
+                ok, message = action_fn(locale)
                 self.finished.emit(ok, message)
 
         class Relay(QObject):
@@ -105,35 +108,43 @@ class OcrLanguageDialog:
     def _build_rows(self):
         from PySide6.QtWidgets import QLabel, QPushButton
 
-        states = windows_ocr_lang.list_states()
         for row, locale in enumerate(windows_ocr_lang.KNOWN_LOCALES):
-            state = states.get(locale)
+            installed = windows_ocr_lang.is_installed(locale)
             self.grid.addWidget(QLabel(windows_ocr_lang.locale_label(locale)), row, 0)
-            status_label = QLabel(t("ocr_lang.installed") if state == "Installed" else t("ocr_lang.not_installed"))
+            status_label = QLabel(t("ocr_lang.installed") if installed else t("ocr_lang.not_installed"))
             self.grid.addWidget(status_label, row, 1)
-            button = QPushButton(t("ocr_lang.install_button"))
-            button.setEnabled(state != "Installed")
-            button.clicked.connect(lambda _checked, loc=locale: self._on_install_clicked(loc))
+            button = QPushButton(t("ocr_lang.uninstall_button") if installed else t("ocr_lang.install_button"))
+            button.clicked.connect(lambda _checked, loc=locale: self._on_action_clicked(loc))
             self.grid.addWidget(button, row, 2)
             self.rows[locale] = (status_label, button)
 
-    def _on_install_clicked(self, locale):
+    def _on_action_clicked(self, locale):
+        # Decided once, at click time - do_install stays fixed for this one
+        # run even though is_installed(locale) could in principle change
+        # underneath it (it can't, in practice: the button is disabled for
+        # the whole run, so this is really just "don't re-derive it from a
+        # mutable read after the action already changed that same state").
+        do_install = not windows_ocr_lang.is_installed(locale)
+        action_fn = windows_ocr_lang.install if do_install else windows_ocr_lang.uninstall
+
         status_label, button = self.rows[locale]
         button.setEnabled(False)
-        status_label.setText(t("ocr_lang.installing_status"))
+        status_label.setText(t("ocr_lang.installing_status") if do_install else t("ocr_lang.uninstalling_status"))
 
         self._installing_count += 1
-        self._close_button.setEnabled(False)  # see _InstallWorker.start()'s comment on why this matters
+        self._close_button.setEnabled(False)  # see _ActionWorker.start()'s comment on why this matters
 
-        worker = _InstallWorker(locale)
+        worker = _ActionWorker(action_fn, locale)
 
         def on_finished(ok, message):
+            installed_now = windows_ocr_lang.is_installed(locale)
             if ok:
-                status_label.setText(t("ocr_lang.installed"))
+                status_label.setText(t("ocr_lang.installed") if installed_now else t("ocr_lang.not_installed"))
             else:
                 status_label.setText(t("ocr_lang.install_failed_prefix", message=message))
-                button.setEnabled(True)
-            print(f"[ocr_lang] install({locale}) ok={ok} message={message}")
+            button.setText(t("ocr_lang.uninstall_button") if installed_now else t("ocr_lang.install_button"))
+            button.setEnabled(True)
+            print(f"[ocr_lang] {'install' if do_install else 'uninstall'}({locale}) ok={ok} message={message}")
             self._installing_count -= 1
             self._close_button.setEnabled(self._installing_count == 0)
 

@@ -25,8 +25,6 @@ from using it.
   pause translation temporarily.
 - **Region capture mode** - Restrict auto-translation to a specific area of
   the screen, such as a game's subtitle box.
-- **Screen-tap translation** - While real-time auto-translation is paused,
-  translate only the text at the spot you tap on screen.
 - **Recent cache** - When the same line of text appears repeatedly, show the
   cached result instantly instead of re-running OCR and translation.
 
@@ -34,175 +32,119 @@ from using it.
 
 - **Multiple translation engines** - choose between Google Cloud Translate,
   DeepL, Gemini AI, Google Translate, or an AI model via Ollama.
-- **Keybindings** - for screen refresh, pause/resume, and tap-translate.
-  Each action can be bound to Steam Deck's own controls, a gamepad, or a
-  keyboard, and each binding supports long-press and multi-key combos.
-- **Legacy OCR** - a TesseractOCR-based engine, built early in development,
-  is still available as a fallback. It's unlikely to see active maintenance
-  going forward, and using it naturally requires TesseractOCR itself.
+- **Keybindings** - for screen refresh and pause/resume. Each action can be
+  bound to a keyboard, mouse button, or gamepad, and each binding supports
+  long-press and multi-key combos. Default: **F9** (tap to refresh, hold to
+  pause/resume).
 
 ## Requirements
 
-- Steam Deck (SteamOS) - experimental support on other gamescope-based Linux
-  handhelds/desktops, see [Running on a non-Deck Linux host](#running-on-a-non-deck-linux-host)
-- [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) installed
-- distrobox + podman, for the OCR/translation engine container (installed
-  automatically - see [Setup](#setup) below)
-- Internet connection for the on-device OCR model's one-time download, and
-  for any of the cloud translation engines
+- Windows 10 or Windows 11
+- Nothing else to install up front - the download is a self-contained app,
+  no separate Python install needed
+- The target OCR language's Windows OCR component (installed from inside
+  the app - see [Setup](#setup) below), and an internet connection for that
+  one-time download
+- Internet connection for the default (free) translation engine, or for any
+  of the other cloud translation engines
 
 ## Installation
 
-1. Install [Decky Loader](https://decky.xyz) on your Steam Deck if you
-   haven't already - see the [official install
-   guide](https://deckyloader.org/guide/how-to-install-decky-loader-steam-deck)
-   for details.
-2. [Click here to download the latest version.](../../releases/latest)
-3. In Steam's Quick Access Menu, press the plug icon to open the Decky
-   Loader settings you installed in step 1.
-4. In Decky Loader's settings, select **General** from the left-hand menu,
-   then enable the **Developer Mode** toggle near the bottom.
-5. New menu items ("Plugins", "Developer", "Testing", etc.) will appear.
-   Choose **Developer**, then press the **ZIP file** button and open the
-   file you downloaded to install it - or press the **URL** button and
-   paste the URL of the latest zip instead.
+1. [Click here to download the latest Windows
+   version.](../../releases/latest) -
+   `LiveTranslator-kun-windows-<version>.zip`
+2. Extract the zip anywhere you like - it doesn't need to go in
+   `Program Files`, and there's no traditional installer.
+3. Run `LiveTranslator-kun.exe` inside the extracted folder. A tray icon
+   appears (in the system tray, or under the small "^" overflow arrow next
+   to the clock) - right-click it for **Settings...**, and to start/pause
+   capture.
 
 ## Setup
 
-The plugin runs its OCR/translation engine inside a small container, which
-needs a one-time setup:
-
-1. From the plugin's menu, press **OCR Settings**.
-2. On the screen that opens, press **Set Up OCR Environment**. This
-   installs distrobox/podman if missing, creates the container, and installs
-   the Python packages the engine needs. If a step fails (a temporary
-   network issue, for example), it's safe to press again - it resumes from
-   where it left off. The setup log is shown live while it runs. Once the
-   small labels above the button read `distrobox:installed` and
-   `container:created`, setup is complete.
-3. The default OCR engine (Chrome Screen AI) still needs to be downloaded.
-   Press **Download** at the bottom of the same screen. Once the label above
-   the button reads `Installed`, it's ready.
+- **Windows SmartScreen warning on first run**: this app isn't code-signed,
+  so the first time you run `LiveTranslator-kun.exe`, Windows will likely
+  show a blue **"Windows protected your PC"** screen. Click **More info**,
+  then **Run anyway** - this is a one-time thing per download.
+- **OCR language component**: Windows' built-in OCR needs the target
+  language's OCR component installed as a separate Windows feature - this
+  is the language of the *on-screen text you want to translate* (e.g.
+  English for most games), independent of your display language and of the
+  translation target language. Right-click the tray icon → **Settings...**
+  → next to **OCR engine**, press **Manage OCR languages...**, then
+  **Install** next to the right language. This triggers a real Windows
+  administrator (UAC) prompt - approve it. It needs an internet connection
+  the first time, and can take a little while.
 
 Optional, only if you plan to use them:
 
 - **A cloud API key**, if you use Gemini AI, Google Cloud Translate, or
-  DeepL. Press **Translation Settings** in the plugin's menu to open the
-  engine-selection screen - paid engines generally require an API key,
-  entered there. As the author, I'd personally recommend Google Cloud
-  Translate the most.
-- **Ollama**, if you set the translation engine to Ollama - point it at a
-  local or LAN Ollama server. The plugin itself doesn't install or run
-  Ollama. There's no UI field for this: create a file named
-  `translate_url.txt` in the plugin's data directory
-  (`~/homebrew/data/PlayTranslate/` on a Deck) containing the server's
-  `http://host:port/translate` URL, or set the `PLAYTRANSLATE_TRANSLATE_URL`
-  environment variable before Steam starts. With neither set, it defaults to
-  `http://127.0.0.1:8787/translate`.
+  DeepL. In **Settings...**, switch **Translation engine** to the one you
+  want - each one's own API key field appears once selected. The default
+  engine (Google Translate) needs no key or account at all. As the author,
+  I'd personally recommend Google Cloud Translate the most among the paid
+  options.
+- **Ollama**, if you set the translation engine to Ollama - point **URL** at
+  a local or LAN Ollama server. The app itself doesn't install or run
+  Ollama.
 
 ## How to use
 
-1. Press **Start Capture** on the plugin's settings screen to begin
-   real-time translation.
-2. Your configured keybinding refreshes the subtitle (default: L4) or
-   toggles pause/resume (default: hold L4).
-3. While paused, hold the tap-translate key (default: L4+L2) and long-press
-   the screen to show only the translation for the text at that spot, at the
-   bottom of the screen.
-4. Change keybindings via the **Key Bindings** button on the settings
-   screen.
-5. Press **Stop Capture** to end real-time translation. The plugin doesn't
-   try to detect whether you're actually in a game before translating, so
-   pause it or press **Stop Capture** whenever you don't need translation.
+1. Right-click the tray icon and choose **Start Capture** to begin
+   real-time translation - the app starts paused, so nothing happens until
+   you do this (or use the pause/resume keybinding below). The same menu
+   item turns into **Pause** once running, so you can use it to stop again
+   too.
+2. The default keybinding is **F9**: tap it to refresh (re-detect the
+   current screen), hold it to toggle pause/resume - the same effect as the
+   tray menu item above.
+3. Change keybindings via **Settings...** → **Configure keybindings...**.
+4. Leaving **Target window title** blank in Settings captures the whole
+   screen; typing part of a window's title (e.g. a game's name) restricts
+   capture to just that window instead - press **Refresh list** to pick
+   from currently open windows.
+5. Choose **Exit** from the tray menu to quit. The app doesn't try to detect
+   whether you're actually in a game before translating, so pause it or
+   exit whenever you don't need translation.
 
-### Region Capture Mode
+### Capture Region (Fixed ROI)
 
-1. Instead of **Start Capture**, click **Start Region Mode** to start
-   auto-translation limited to a specific area of the screen. Useful for
-   games where subtitles always appear in the same place, or when
-   translating the whole screen is more distracting than helpful.
-2. Configure the region to translate via the **Region Mode Config** button
-   on the settings screen.
+1. In **Settings...**, press **Configure capture region (fixed ROI)...**.
+2. Take a screenshot preview, then set **Left**/**Top**/**Width**/**Height**
+   to the area you want to track - useful for games where subtitles always
+   appear in the same place, or when translating the whole screen is more
+   distracting than helpful.
+3. Press **Save && enable** to turn it on, or **Disable fixed ROI** to go
+   back to scanning the whole captured area.
 
 ## Troubleshooting
 
+**Windows blocked the app from running**
+See [Setup](#setup) above - click **More info**, then **Run anyway** on the
+SmartScreen warning.
+
 **Nothing is detected / translation never appears**
-Check that the Capture Control area on the settings screen shows "running".
-If the OCR environment hasn't been set up yet, the OCR tab will say so - see
-[Setup](#setup) above.
+Right-click the tray icon - if the menu says **Start Capture**, capture is
+currently paused; choose it to begin. If the translation engine or the OCR
+engine isn't configured yet, a tray notification says so when the app
+starts - open **Settings...** to fix it. Also check that **Target window
+title** in Settings actually matches an open, non-minimized window, or is
+left blank to capture the whole screen.
 
 **A translation engine says the API key is wrong**
-Check that the key for that provider was copied correctly into the settings
-screen. Gemini, Google Cloud Translate, and DeepL each use their own
-separate key.
+Check that the key for that provider was copied correctly into
+**Settings...**. Gemini, Google Cloud Translate, and DeepL each use their
+own separate key.
 
-**OCR Environment setup fails partway through**
-Press **Set Up OCR Environment** again - it's idempotent and will pick up
-where it left off. If it keeps failing, check the setup log shown in the OCR
-tab for the actual error.
-
-### Running on a non-Deck Linux host
-
-The plugin is built and tested against SteamOS/Deck, but has also been
-confirmed working on a non-Deck Linux host (gamescope + Decky Loader on
-CachyOS), with a few caveats around gamepad/keyboard input:
-
-- **gamescope is required**, to get an environment equivalent to Steam
-  Deck's. It's a Wayland micro-compositor developed by Valve, with a rich
-  set of features tuned for gaming, used on Steam Deck and on Linux desktops
-  running gaming-focused OSes like SteamOS. Running Steam through gamescope
-  and having it output to PipeWire is what lets this plugin capture the
-  game's video as a stream in the first place - which is genuinely
-  impressive. gamescope also has MangoHud's overlay functionality built in,
-  and using that to show subtitles was actually the original idea behind
-  this plugin. Installation depends on your distribution - on Arch-based
-  systems (the same family as SteamOS), this usually works:
-  ```bash
-  sudo pacman -S gamescope
-  ```
-- **Decky Loader runs each plugin's backend as an unprivileged user with no
-  supplementary groups**, so `/dev/hidraw*`/`/dev/input/event*` may stay
-  unreadable even after adding your user to the `input` group. If
-  keybindings don't detect your controller/keyboard, add a permissive udev
-  rule:
-  ```bash
-  printf '%s\n%s\n' \
-    'SUBSYSTEM=="hidraw", MODE="0666"' \
-    'SUBSYSTEM=="input", KERNEL=="event*", MODE="0666"' \
-    | sudo tee /etc/udev/rules.d/99-livetranslate-hidraw.rules
-  sudo udevadm control --reload
-  sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input
-  sudo systemctl restart plugin_loader
-  ```
-  This makes those devices world-readable/writable on the host - a
-  reasonable tradeoff on a single-user desktop, but worth knowing about on a
-  shared machine.
-- **A USB gamepad bound to the `xpad` kernel driver** (most wired Xbox
-  controllers) doesn't expose a hidraw node, so keybindings fall back to
-  plain evdev for those - digital buttons only, no analog triggers.
-- **Closing an overlay (this plugin's own settings screen) can leave the
-  game unable to receive gamepad input** until you click into the game
-  window with a mouse. This has only been seen on a desktop Linux host
-  running gamescope directly, not on a real Deck; there's no fix from the
-  plugin's side yet.
-- **Screen-tap translation doesn't work.** Pressing the tap-translate key
-  and then clicking the screen sometimes shows no translation, and
-  afterward the game window won't regain focus until you click it with the
-  mouse. This is likely tied to the overlay-focus issue above.
-- **Running gamescope nested inside a Wayland compositor can cause issues
-  with gamepad input and overlay display.** gamescope can run nested on top
-  of an existing display server/desktop environment, but this can't be
-  guaranteed not to cause problems with Decky Loader. My personal
-  recommendation is to run gamescope in embedded mode instead - i.e. select
-  gamescope as the session at your login screen, so the machine boots
-  straight into a dedicated full-screen Steam UI, Deck-style. This differs
-  from launching Steam from the desktop and switching to Big Picture mode:
-  with no other compositor running underneath, this setup is much less
-  prone to the issues above.
+**OCR language install fails, or a language shows "Not installed" that
+you're sure you already installed**
+Press **Install** again next to that language in **Manage OCR
+languages...** - it's safe to retry. It needs an internet connection and a
+real Windows administrator (UAC) approval each time.
 
 ## Development
 
-See [docs/BUILDING.md](docs/BUILDING.md) for building from source.
+See [docs/BUILDING_WINDOWS.md](docs/BUILDING_WINDOWS.md) for building from source.
 
 ## Support
 
@@ -271,3 +213,7 @@ You can also support development via [Ko-fi](https://ko-fi.com/neatsorg).
 ## License
 
 [GPLv3](LICENSE)
+
+The Windows distribution bundles several third-party libraries (PySide6,
+DXcam, pywin32, pywinrt, and others) - see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for their licenses.

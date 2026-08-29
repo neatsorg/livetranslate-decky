@@ -1,9 +1,0 @@
-{
-  "name": "LiveTranslator-kun",
-  "author": "playtranslate-deck",
-  "api_version": 1,
-  "publish": {
-    "tags": ["translation", "overlay", "gamescope"],
-    "description": "Decky control panel for the PlayTranslate capture engine."
-  }
-}

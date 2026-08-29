@@ -5,6 +5,9 @@ __pycache__/
 node_modules/
 dist/
 out/
+build/
+.build-venv/
+bin/windows/licenses/
 
 *.log
 .DS_Store

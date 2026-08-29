@@ -10,7 +10,7 @@ frameless/click-through/borderless fullscreen (see pipeline_loop.py), so
 without some other visible control surface there would be no way for a user
 to open Settings or quit the app at all short of Task Manager.
 
-Usage: pythonw tray_app.py <model_resources_dir>
+Usage: pythonw tray_app.py
 """
 import sys
 from pathlib import Path
@@ -50,12 +50,7 @@ def _make_tray_icon():
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: tray_app.py <model_resources_dir>")
-        sys.exit(1)
-    model_dir = sys.argv[1]
-
-    handles = _build_app(model_dir)
+    handles = _build_app()
     app = handles.app
     # The HUD QWidget counts as a top-level window to Qt, but closing it
     # isn't how this app is meant to quit - only the tray's Exit item is.

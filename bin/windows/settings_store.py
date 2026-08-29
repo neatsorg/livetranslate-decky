@@ -41,16 +41,28 @@ DEFAULTS = {
     },
     "target_lang": "ja",
     "source_lang": "auto",
-    # "screenai" (chrome_screen_ai.dll, per-line confidence, slower) or
-    # "windows_ocr" (Windows.Media.Ocr, no confidence score, much faster -
-    # confirmed live ~0.19s/frame vs screenai's 1-2s+ - but needs the
-    # matching per-language OCR component installed via Windows Settings,
-    # see windows_ocr_lang.py).
-    "ocr_engine": "screenai",
+    # "windows_ocr" (Windows.Media.Ocr) is the only engine: ~0.19s/frame,
+    # confirmed live faster and license-cleaner than the Chrome Screen AI
+    # path the Linux side still uses (dropped here 2026-08-28 - see
+    # project_playtranslate_windows_port memory). Needs the matching
+    # per-language OCR component installed via Windows Settings, see
+    # windows_ocr_lang.py.
+    "ocr_engine": "windows_ocr",
     # BCP-47 tag for Windows.Media.Ocr specifically - it needs a concrete
     # language (no "auto"), independent of target_lang/source_lang above
     # which describe the *translation* direction, not what OCR should read.
     "windows_ocr_language": "en-US",
+    # Locales confirmed installed via this app's own "Manage OCR languages"
+    # dialog - see windows_ocr_lang.py's module docstring for why this cache
+    # exists instead of just querying DISM live each time (short version:
+    # Get-WindowsCapability -Online genuinely requires admin rights under a
+    # real UAC-filtered token, confirmed live 2026-08-29 - querying it live
+    # for *display* would mean a UAC prompt just to open this dialog). A
+    # locale already installed before the user ever used this dialog (e.g.
+    # it shipped with the OS) won't show up here until Install is clicked on
+    # it once - harmless, since Add-WindowsCapability on an
+    # already-installed capability just succeeds immediately.
+    "ocr_installed_locales": [],
     # Keyboard/mouse/gamepad bindings - same shape as the Linux side's
     # keybinding_settings.json (see main.py/Keybindings.tsx): a list of
     # {id, command, keys, long_press, threshold_ms}. "keys" holds up to 3

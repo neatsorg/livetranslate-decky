@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # for providers/, region_tracker
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # for screenai_engine, settings_store
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for windows_ocr_engine, settings_store
 
 import settings_store
 
@@ -350,7 +350,7 @@ def _mask_regions(frame_bgra, regions):
 
 
 def _to_bbox_dict(blocks):
-    """screenai_engine.proto_to_blocks() returns bbox as a plain tuple;
+    """WindowsOcrEngine.discover_blocks() returns bbox as a plain tuple;
     region_tracker's set_regions()/merge_regions() expect the
     ocr_worker.py /discover_blocks wire shape (bbox as a dict)."""
     out = []
@@ -362,11 +362,10 @@ def _to_bbox_dict(blocks):
 
 
 class PipelineLoop:
-    def __init__(self, model_dir):
+    def __init__(self):
         from region_tracker import MultiRegionTracker
         from translate_server import TranslationCache
 
-        self.model_dir = model_dir
         self.settings = settings_store.load()
         capture_cfg = self.settings["capture"]
         try:
@@ -480,17 +479,12 @@ class PipelineLoop:
                 f"open Settings to fix it; pausing capture until then"
             )
 
-        ocr_engine_name = self.settings.get("ocr_engine", "screenai")
+        ocr_engine_name = self.settings.get("ocr_engine", "windows_ocr")
         engine = None
         try:
-            if ocr_engine_name == "windows_ocr":
-                from windows_ocr_engine import WindowsOcrEngine
+            from windows_ocr_engine import WindowsOcrEngine
 
-                engine = WindowsOcrEngine(self.settings.get("windows_ocr_language", "en-US"))
-            else:
-                from screenai_engine import ScreenAIEngine
-
-                engine = ScreenAIEngine(self.model_dir)
+            engine = WindowsOcrEngine(self.settings.get("windows_ocr_language", "en-US"))
         except Exception as exc:
             print(
                 f"[settings] OCR engine {ocr_engine_name!r} failed to initialize: {exc} - "
@@ -637,20 +631,11 @@ class PipelineLoop:
             label.hide()
 
     def _ocr_blocks(self, frame_bgra):
-        """OCR one BGRA frame (full or cropped), dispatching to whichever
-        engine is configured. Returns screenai_engine.proto_to_blocks()'s
-        shape either way: [{"id","text","conf","bbox":(x0,y0,x1,y1)}, ...]."""
+        """OCR one BGRA frame (full or cropped) via WindowsOcrEngine. Returns
+        [{"id","text","conf","bbox":(x0,y0,x1,y1)}, ...]."""
         t0 = time.monotonic()
-        if self.ocr_engine_name == "windows_ocr":
-            h, w = frame_bgra.shape[0], frame_bgra.shape[1]
-            blocks = self.engine.discover_blocks(frame_bgra.tobytes(), w, h)
-        else:
-            from screenai_engine import load_rgba_from_array, proto_to_blocks
-
-            rgba_array = frame_bgra[:, :, [2, 1, 0, 3]]
-            rgba_bytes, w, h, sx, sy = load_rgba_from_array(rgba_array, self.engine.max_dim)
-            proto = self.engine.perform(rgba_bytes, w, h)
-            blocks = [] if proto is None else proto_to_blocks(proto, sx, sy, min_confidence=0.3)
+        h, w = frame_bgra.shape[0], frame_bgra.shape[1]
+        blocks = self.engine.discover_blocks(frame_bgra.tobytes(), w, h)
         print(f"[timing] ocr ({self.ocr_engine_name}, {frame_bgra.shape[1]}x{frame_bgra.shape[0]}) took {time.monotonic() - t0:.3f}s")
         return blocks
 
@@ -1155,30 +1140,60 @@ class PipelineLoop:
                 self.labels[block_id] = label
             label.setFixedWidth(int(max(lw, 120)))
             label.setText(translation)
-            label.adjustSize()
             # Confirmed live 2026-08-28 (real screenshot, plus the user
-            # directly correcting an initial misreading of it): adjustSize()
-            # sizes the label purely for the *translated* text's own
-            # wrapped line count, which can come out shorter than the
-            # original block's own detected bbox height (logged case: bbox
-            # height 74 logical px vs adjustSize()'s 52) - Japanese often
-            # renders more compactly per line than the English source did,
-            # or simply wraps to fewer lines. Since the box sits exactly
-            # over the original on-screen text, a shorter box doesn't fully
-            # cover it - the *original*, untranslated game text peeks out
-            # from both above and below the box (confirmed by the user:
-            # both edges, not just one), which had misread as garbled/
-            # overlapping text in an earlier pass of this same
-            # investigation - it was actually two genuinely different,
-            # individually-correct texts (our clean translation box, plus
-            # slivers of the real original English around it), not a
-            # rendering-corruption bug. Fix: never let the box be shorter
-            # than the original detected region, and keep it centered on
-            # that region's own vertical center (not top-anchored) so a
-            # shortfall is covered symmetrically on both edges, matching
-            # the user's report that overflow happened on both sides, not
-            # just the bottom a naive top-anchored grow would have fixed.
-            final_h = max(label.height(), int(lh))
+            # directly correcting an initial misreading of it): the box
+            # must never be shorter than the original detected region -
+            # since it sits exactly over the original on-screen text, a
+            # shorter box doesn't fully cover it and the *original*,
+            # untranslated game text peeks out from both above and below
+            # (confirmed by the user: both edges, not just one - this had
+            # misread as garbled/overlapping text in an earlier pass of
+            # this same investigation, but was actually two genuinely
+            # different, individually-correct texts overlapping, not a
+            # rendering-corruption bug).
+            #
+            # label.adjustSize() used to be the other half of this (max()'d
+            # against int(lh) below) but confirmed live 2026-08-29 it isn't
+            # trustworthy for multi-line word-wrapped CJK text - real
+            # logged case: two blocks with the same 2-line wrap and similar
+            # width came out 244x34 and 254x51, a ~1.5x height difference
+            # for comparable content. The 34 one visibly clipped the
+            # middle sliver of each glyph on screen (top/bottom of every
+            # character cut off, exactly matching a user report of the
+            # bottommost of several close-together blocks being
+            # "illegible, top and bottom missing"), and it wasn't rescued
+            # by the int(lh) floor because that floor is the *original*
+            # English text's own bbox height, which has no necessary
+            # relationship to how many lines the *translated* text wraps
+            # into - the same mismatch also explains the opposite-looking
+            # complaint (a block with excessive top/bottom margin): a
+            # multi-line original English paragraph's tall bbox floors a
+            # Japanese translation that compacts into fewer/shorter lines.
+            #
+            # KNOWN REMAINING ISSUE (2026-08-29, deferred - clipping above
+            # was the priority for the initial release): the int(lh) floor
+            # itself still occasionally makes a box noticeably taller than
+            # its own translated text needs, for the exact reason above.
+            # A real fix needs the box to cover the original region without
+            # necessarily being *sized* to it - e.g. painting over just the
+            # original bbox separately from the (independently, correctly
+            # sized) translation label - not attempted this pass.
+            #
+            # heightForWidth(), not a separate QFontMetrics simulation:
+            # tried computing the wrapped height by hand via
+            # QFontMetrics.boundingRect(Qt.TextWordWrap, ...) first, but
+            # confirmed live 2026-08-29 that has its own real mismatch
+            # against how this QLabel actually wraps - right at the wrap
+            # boundary (one real case: a single trailing character wrapping
+            # to its own second line got only one line's worth of height
+            # reserved instead of two), i.e. a *different* wrapping
+            # algorithm/metrics path than QLabel's own, not just a wrong
+            # padding constant. heightForWidth() asks this exact QLabel
+            # (already given its real font, text, and fixed width) what
+            # *it* needs - the same computation it uses for its own
+            # sizeHint() - so there is no second implementation of word
+            # wrap left to disagree with the real one.
+            final_h = max(label.heightForWidth(label.width()), int(lh))
             label.setFixedHeight(final_h)
             label.move(int(lx0), int(lcy - final_h / 2))
             label.show()
@@ -1231,7 +1246,7 @@ def show_toast(handles, text, duration_ms=2000):
     handles.toast_timer.start(duration_ms)
 
 
-def _build_app(model_dir):
+def _build_app():
     """Shared setup between main() (a fixed-duration CLI harness used for
     dev testing, e.g. the LTPipelineLoop scheduled task) and tray_app.py
     (the real day-to-day entry point, which only quits when the user picks
@@ -1278,7 +1293,7 @@ def _build_app(model_dir):
     # a click-through overlay that isn't a real fullscreen application.
     win.show()
 
-    pipeline = PipelineLoop(model_dir)
+    pipeline = PipelineLoop()
 
     import os
     import queue
@@ -1373,9 +1388,21 @@ def _build_app(model_dir):
 
         No auto-relaunch here (no supervisor process exists yet to restart
         this one after it exits) - that's a real next step if this recurs
-        often enough to be worth building, not attempted in this pass."""
+        often enough to be worth building, not attempted in this pass.
+
+        Must skip entirely while keybinding_poll_paused is set - pause_for_dialog()
+        stops the tick timer on purpose while Settings/Keybindings/ROI/
+        OCR-language is open, and OCR-language's install flow alone (a real
+        UAC prompt + DISM download + confirm-retry loop) can easily run past
+        WATCHDOG_STALL_S under completely normal use. Confirmed live
+        2026-08-28: without this check, the watchdog can't tell "the user is
+        still looking at an intentionally-paused dialog" from "genuinely
+        stuck" and force-exits mid-install - this is what a user reported as
+        the app randomly crashing right after installing an OCR language."""
         while True:
             time.sleep(5.0)
+            if keybinding_poll_paused.is_set():
+                continue
             stalled_for = time.monotonic() - pipeline.last_tick_at
             if stalled_for >= WATCHDOG_STALL_S:
                 print(
@@ -1483,6 +1510,14 @@ def pause_for_dialog(handles):
 
 
 def resume_after_dialog(handles):
+    # Reset before clearing keybinding_poll_paused, not after: the watchdog
+    # thread wakes up on its own 5s cycle independent of this call, so
+    # without this it could see the stale pre-pause last_tick_at (however
+    # long the dialog was actually open for) in the instant after the pause
+    # flag clears but before the restarted timer's first real tick() has
+    # run - a false "stuck" reading exactly at dialog-close, not just during
+    # a still-open dialog (see _watchdog_thread_main()'s docstring).
+    handles.pipeline.last_tick_at = time.monotonic()
     handles.keybinding_poll_paused.clear()
     handles.timer.start(TICK_MS)
 
@@ -1507,13 +1542,9 @@ def _shutdown(handles):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("usage: pipeline_loop.py <model_resources_dir> [duration_s]")
-        sys.exit(1)
-    model_dir = sys.argv[1]
-    duration_s = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
+    duration_s = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
 
-    handles = _build_app(model_dir)
+    handles = _build_app()
 
     from PySide6.QtCore import QTimer
 
