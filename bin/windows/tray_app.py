@@ -74,7 +74,13 @@ def main():
         # access-violation crash this prevents.
         pause_for_dialog(handles)
         try:
-            dlg = SettingsDialog()
+            # Passed through to RoiCropDialog so its screenshot grabs reuse
+            # CaptureWorker's own dedicated dxcam thread instead of touching
+            # dxcam directly from the Qt main thread - see CaptureWorker's
+            # class docstring for why that's a real hazard (a previously
+            # confirmed live freeze from calling dxcam off its one dedicated
+            # thread), not just a style preference.
+            dlg = SettingsDialog(capture_worker=handles.pipeline.camera)
             dlg.exec()
         finally:
             resume_after_dialog(handles)

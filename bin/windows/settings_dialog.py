@@ -46,11 +46,19 @@ class SettingsDialog:
     without necessarily instantiating QApplication first (callers that
     already have one, e.g. a future tray app, just reuse it)."""
 
-    def __init__(self):
+    def __init__(self, capture_worker=None):
         from PySide6.QtWidgets import (
             QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLineEdit,
             QPushButton, QVBoxLayout,
         )
+
+        # Only used to hand off to RoiCropDialog (see _on_manage_roi()) so
+        # its screenshot grabs go through the same dedicated dxcam thread
+        # the real capture loop uses, instead of a separate ad-hoc camera
+        # from the Qt main thread. None in standalone use (`python
+        # settings_dialog.py`) - RoiCropDialog falls back to its own direct
+        # dxcam.create() in that case.
+        self._capture_worker = capture_worker
 
         self.settings = settings_store.load()
         import i18n
@@ -188,7 +196,12 @@ class SettingsDialog:
     def _on_manage_roi(self):
         from roi_crop_dialog import RoiCropDialog
 
-        dlg = RoiCropDialog()
+        # hide_during_screenshot: so RoiCropDialog can hide this Settings
+        # window during its own screenshot grabs - otherwise Settings sits
+        # on top of the game window and gets baked into the "clean"
+        # screenshot the ROI picker is supposed to show (confirmed live
+        # 2026-08-30). capture_worker: see this dialog's own __init__.
+        dlg = RoiCropDialog(hide_during_screenshot=[self.dialog], capture_worker=self._capture_worker)
         dlg.exec()
         self._resync_settings_after_child_dialog()
 

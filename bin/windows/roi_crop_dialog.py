@@ -75,11 +75,33 @@ class RoiPreviewWidget:
 
 
 class RoiCropDialog:
-    def __init__(self):
+    def __init__(self, hide_during_screenshot=None, capture_worker=None):
         from PySide6.QtWidgets import (
             QDialog, QDialogButtonBox, QLabel, QPushButton, QSlider, QVBoxLayout,
         )
         from PySide6.QtCore import Qt
+
+        # When given (the real tray-app path), _grab_screenshot() submits
+        # its grab through this CaptureWorker's own dedicated dxcam thread
+        # instead of creating a separate dxcam camera and calling it
+        # directly from the Qt main thread here - see CaptureWorker's class
+        # docstring (pipeline_loop.py) for why that's a real, previously
+        # confirmed hazard (dxcam/DXGI calls off their one dedicated thread
+        # have caused a permanent freeze before), not just unnecessary
+        # caution. None in standalone use (`python roi_crop_dialog.py`),
+        # where there's no other thread already using dxcam to collide with.
+        self._capture_worker = capture_worker
+
+        # Windows (e.g. the Settings dialog this is normally opened from)
+        # whose own on-screen presence would otherwise get baked into the
+        # screenshot below - hidden for the moment of each grab, then
+        # restored. Defaults to none for standalone use (`python
+        # roi_crop_dialog.py`), where there's no parent dialog to worry
+        # about. This dialog's own window is *also* hidden during capture
+        # (see _grab_screenshot()) - it's every bit as much "something
+        # covering the game" as the Settings dialog is, just not passed in
+        # here since this object already has a reference to itself.
+        self._hide_during_screenshot = list(hide_during_screenshot or [])
 
         self.settings = settings_store.load()
         capture_cfg = self.settings.get("capture", {})
@@ -147,6 +169,7 @@ class RoiCropDialog:
         self.preview.set_roi(self.roi)
 
     def _retake_screenshot(self):
+        hidden = self._hide_for_capture()
         try:
             pixmap = self._grab_screenshot()
             self.preview.set_pixmap(pixmap)
@@ -154,39 +177,150 @@ class RoiCropDialog:
         except Exception as exc:
             self.status_label.setText(t("roi.screenshot_failed", error=exc))
             print(f"[roi_crop] screenshot failed: {exc}")
+        finally:
+            self._restore_after_capture(hidden)
+
+    def _hide_for_capture(self):
+        """Hides this dialog and whatever else was passed in as
+        hide_during_screenshot - only the ones actually visible right now,
+        so this is a no-op the very first time a screenshot is taken (this
+        dialog's own __init__ calls _retake_screenshot() before the caller
+        has called .exec() on it yet, so it isn't shown yet at that point -
+        the Settings dialog it was opened from still is, though, and still
+        gets hidden here).
+
+        Uses win32gui.ShowWindow() directly on the native HWND, not this
+        widget's own Qt-level .hide()/.show() - confirmed live 2026-08-30
+        that Qt's own hide()/show() on hide_during_screenshot's dialog (a
+        *different*, independently application-modal QDialog, exec()'ing
+        its own event loop concurrently with this one, with no Qt parent-
+        child relationship between the two - both are plain QDialog(), no
+        parent passed) corrupts Qt's own modal/activation bookkeeping badly
+        enough that the other dialog reproducibly reactivates itself and
+        this one stops responding to its own OK/Cancel afterward, forcing
+        the whole app to be quit from the tray to recover. Toggling the raw
+        WS_VISIBLE style at the Win32 level instead never touches Qt's own
+        widget-visibility state machine at all, so there's nothing for it
+        to get confused about - Qt never even finds out.
+
+        Disables DWM's show/hide transition for each window before hiding it
+        (DWMWA_TRANSITIONS_FORCEDISABLED) - confirmed live 2026-08-30 that
+        without this, the hidden dialog still showed up semi-transparent in
+        its own "clean" screenshot: SW_HIDE alone doesn't make DWM cut the
+        window's cross-fade instantly, and the capture landed mid-fade
+        rather than after it (increasing the delay below wouldn't have
+        fixed this reliably either - the fade duration itself isn't
+        something this code controls, so there's no delay guaranteed long
+        enough short of disabling the fade). Also gives DWM ~50ms before the
+        grab in _grab_screenshot() as a smaller safety margin for ordinary
+        frame-composition latency on top of that."""
+        import ctypes
+        import time
+
+        import win32con
+        import win32gui
+
+        DWMWA_TRANSITIONS_FORCEDISABLED = 3
+        disable = ctypes.c_int(1)
+
+        hidden = [w for w in [self.dialog] + self._hide_during_screenshot if w.isVisible()]
+        for w in hidden:
+            hwnd = int(w.winId())
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(disable), ctypes.sizeof(disable)
+            )
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+        if hidden:
+            time.sleep(0.05)
+        return hidden
+
+    def _restore_after_capture(self, hidden):
+        import ctypes
+
+        import win32con
+        import win32gui
+
+        DWMWA_TRANSITIONS_FORCEDISABLED = 3
+        enable = ctypes.c_int(0)
+
+        for w in hidden:
+            hwnd = int(w.winId())
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            # Re-enable transitions for this window afterward - the force-
+            # disable in _hide_for_capture() is only meant to cover this one
+            # capture, not to permanently strip this window's normal
+            # show/hide fade for the rest of its life.
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(enable), ctypes.sizeof(enable)
+            )
 
     def _grab_screenshot(self):
         """One-off dxcam grab matching the currently-configured capture
         target (window_title if set, else the whole monitor) - reads
         settings fresh each call so this reflects whatever's saved, not
-        just what was loaded when the dialog opened."""
-        import dxcam
+        just what was loaded when the dialog opened.
 
+        Goes through self._capture_worker (CaptureWorker.grab(), which
+        submits to its own dedicated dxcam thread) when one was passed in,
+        rather than creating and calling a separate dxcam camera directly
+        from this method's own (Qt main) thread. Not what actually fixed
+        the "hidden dialog still visible in its own screenshot" bug (that
+        was the DWM transition disable in _hide_for_capture() - the frame
+        this method got back was equally stale either way, on-thread or
+        off) - kept anyway on separate grounds: CaptureWorker's own class
+        docstring documents dxcam/DXGI calls off their one dedicated thread
+        as a previously confirmed hazard elsewhere in this app (a
+        reproducible freeze), and there's no reason to reintroduce that
+        pattern here just because it wasn't *this* bug's cause too."""
         from window_finder import ensure_dpi_aware, find_window_rect
 
         ensure_dpi_aware()
         capture_cfg = settings_store.load().get("capture", {})
-        camera = dxcam.create(
-            device_idx=capture_cfg.get("device_idx", 0), output_idx=capture_cfg.get("output_idx", 0),
-            output_color="RGB",
-        )
         window_title = capture_cfg.get("window_title", "").strip()
+
+        if self._capture_worker is not None:
+            camera_width, camera_height = self._capture_worker.width, self._capture_worker.height
+            grab = self._capture_worker.grab
+        else:
+            # Standalone use only (`python roi_crop_dialog.py`) - no
+            # CaptureWorker exists to submit through, and nothing else on
+            # this process is touching dxcam yet either, so calling it
+            # directly here carries none of the cross-thread risk above.
+            import dxcam
+
+            camera = dxcam.create(
+                device_idx=capture_cfg.get("device_idx", 0), output_idx=capture_cfg.get("output_idx", 0),
+                output_color="RGB",
+            )
+            camera_width, camera_height = camera.width, camera.height
+            grab = camera.grab
+
         region = None
         if window_title:
             rect = find_window_rect(window_title)
             if rect is not None:
                 region = (
                     max(0, rect[0]), max(0, rect[1]),
-                    min(camera.width, rect[2]), min(camera.height, rect[3]),
+                    min(camera_width, rect[2]), min(camera_height, rect[3]),
                 )
-        frame = camera.grab(region=region) if region else camera.grab()
+        frame = grab(region=region) if region else grab()
         if frame is None:
             raise RuntimeError("grab() returned None")
 
         from PySide6.QtGui import QImage, QPixmap
 
-        h, w = frame.shape[0], frame.shape[1]
-        image = QImage(frame.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+        h, w, channels = frame.shape
+        if channels == 4:
+            # BGRA, 4 bytes/px - matches QImage.Format_RGB32's in-memory byte
+            # order on this little-endian platform exactly (0xffRRGGBB packed
+            # as B,G,R,A bytes), alpha byte simply ignored on display. This
+            # is what CaptureWorker's camera always is (output_color="BGRA");
+            # the standalone fallback above still requests "RGB" (3 bytes/px)
+            # and gets it, since there's no other camera for dxcam.create()
+            # to have already cached under that device/output there.
+            image = QImage(frame.tobytes(), w, h, w * 4, QImage.Format_RGB32)
+        else:
+            image = QImage(frame.tobytes(), w, h, w * 3, QImage.Format_RGB888)
         return QPixmap.fromImage(image)
 
     def _save(self, enable):
