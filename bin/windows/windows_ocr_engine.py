@@ -34,18 +34,24 @@ three real caveats the caller needs to know about:
    API is still a plain synchronous call.
 
 Windows.Media.Ocr only returns flat lines, no paragraph/block grouping
-(same shape problem ocr_worker.py's Tesseract SPARSE_TEXT path already has,
-documented in group_lines_into_blocks() there) - reused directly rather than
-reinventing the same wrapping-paragraph-merge heuristic here.
+(same shape problem ocr_worker.py's Tesseract SPARSE_TEXT path already has) -
+reuses group_lines_into_blocks() from ocr_grouping.py (not from ocr_worker.py
+directly - confirmed live 2026-08-29 that ocr_worker.py imports PIL
+unconditionally at module level for its own Tesseract-specific code, so
+importing anything from it at all pulled in a Pillow dependency this port
+never otherwise needed and never had in requirements.txt - a clean install
+hit ModuleNotFoundError: PIL here, silently leaving the OCR engine
+unconfigured) rather than reinventing the same wrapping-paragraph-merge
+heuristic here.
 """
 import asyncio
 import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # for ocr_worker.group_lines_into_blocks
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # for ocr_grouping.group_lines_into_blocks
 
-from ocr_worker import group_lines_into_blocks
+from ocr_grouping import group_lines_into_blocks
 
 PLACEHOLDER_CONF = 100.0  # no real confidence signal from this engine - see module docstring
 # A real call normally takes ~0.1-0.3s (confirmed live) - this is a safety

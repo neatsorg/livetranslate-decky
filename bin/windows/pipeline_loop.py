@@ -24,7 +24,7 @@ during a discovery tick, per pipeline_test.py's earlier timing) rather than
 on a worker thread - acceptable for this prototype, a real concern before
 this becomes the shipped implementation.
 
-Usage: python pipeline_loop.py <model_resources_dir> [duration_s]
+Usage: python pipeline_loop.py [duration_s]
 """
 import sys
 import time
