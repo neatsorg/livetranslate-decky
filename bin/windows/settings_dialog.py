@@ -201,7 +201,16 @@ class SettingsDialog:
         # on top of the game window and gets baked into the "clean"
         # screenshot the ROI picker is supposed to show (confirmed live
         # 2026-08-30). capture_worker: see this dialog's own __init__.
-        dlg = RoiCropDialog(hide_during_screenshot=[self.dialog], capture_worker=self._capture_worker)
+        # window_title_override: this field's *current* value, which may
+        # not be saved yet (the user hasn't clicked OK) - RoiCropDialog
+        # would otherwise take its screenshot against whatever window_title
+        # was last saved to disk instead, silently mismatching a target the
+        # user just picked but hasn't confirmed.
+        dlg = RoiCropDialog(
+            hide_during_screenshot=[self.dialog],
+            capture_worker=self._capture_worker,
+            window_title_override=self.window_title_combo.currentText(),
+        )
         dlg.exec()
         self._resync_settings_after_child_dialog()
 

@@ -36,7 +36,7 @@ AIコーディングを使用しています。他のコードを流用した部
 
 ## ビルド
 
-ソースからのビルドについては[docs/BUILDING_WINDOWS.md](docs/BUILDING_WINDOWS.md) を参照してください(英語)。
+ソースからのビルドについては[BUILDING_WINDOWS.md](BUILDING_WINDOWS.md) を参照してください(英語)。
 
 ## セットアップ
 

@@ -75,11 +75,24 @@ class RoiPreviewWidget:
 
 
 class RoiCropDialog:
-    def __init__(self, hide_during_screenshot=None, capture_worker=None):
+    def __init__(self, hide_during_screenshot=None, capture_worker=None, window_title_override=None):
         from PySide6.QtWidgets import (
             QDialog, QDialogButtonBox, QLabel, QPushButton, QSlider, QVBoxLayout,
         )
         from PySide6.QtCore import Qt
+
+        # _grab_screenshot() reads window_title from settings_store.load()
+        # (disk), not from whatever's currently typed into Settings' own
+        # form field - so opening this dialog right after picking a target
+        # window in Settings, but before clicking OK, silently took the
+        # screenshot against the *previously saved* target (the whole
+        # screen, on a fresh install) instead. Passed in explicitly from
+        # SettingsDialog's live form value rather than fixed by having this
+        # dialog write Settings' not-yet-confirmed field to disk early,
+        # which would also raise its own question of whether that write
+        # should survive Settings then being Cancelled. None in standalone
+        # use, where there's no separate form holding a newer value anyway.
+        self._window_title_override = window_title_override
 
         # When given (the real tray-app path), _grab_screenshot() submits
         # its grab through this CaptureWorker's own dedicated dxcam thread
@@ -169,8 +182,16 @@ class RoiCropDialog:
         self.preview.set_roi(self.roi)
 
     def _retake_screenshot(self):
-        hidden = self._hide_for_capture()
+        # hidden is built up (appended to) *inside* _hide_for_capture() as
+        # it goes, not returned only at the end - so if it raises partway
+        # through (e.g. the 2nd of 2 windows' DwmSetWindowAttribute/
+        # ShowWindow calls throws), this still reflects whichever window(s)
+        # were actually hidden before that, and _restore_after_capture()
+        # below can still show them back rather than leaving them hidden
+        # forever with nothing left holding a reference to them.
+        hidden = []
         try:
+            self._hide_for_capture(hidden)
             pixmap = self._grab_screenshot()
             self.preview.set_pixmap(pixmap)
             self.status_label.setText("")
@@ -180,7 +201,7 @@ class RoiCropDialog:
         finally:
             self._restore_after_capture(hidden)
 
-    def _hide_for_capture(self):
+    def _hide_for_capture(self, hidden):
         """Hides this dialog and whatever else was passed in as
         hide_during_screenshot - only the ones actually visible right now,
         so this is a no-op the very first time a screenshot is taken (this
@@ -223,16 +244,16 @@ class RoiCropDialog:
         DWMWA_TRANSITIONS_FORCEDISABLED = 3
         disable = ctypes.c_int(1)
 
-        hidden = [w for w in [self.dialog] + self._hide_during_screenshot if w.isVisible()]
-        for w in hidden:
+        candidates = [w for w in [self.dialog] + self._hide_during_screenshot if w.isVisible()]
+        for w in candidates:
             hwnd = int(w.winId())
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(disable), ctypes.sizeof(disable)
             )
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+            hidden.append(w)  # only after it's actually hidden, not before
         if hidden:
             time.sleep(0.05)
-        return hidden
 
     def _restore_after_capture(self, hidden):
         import ctypes
@@ -244,15 +265,22 @@ class RoiCropDialog:
         enable = ctypes.c_int(0)
 
         for w in hidden:
-            hwnd = int(w.winId())
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-            # Re-enable transitions for this window afterward - the force-
-            # disable in _hide_for_capture() is only meant to cover this one
-            # capture, not to permanently strip this window's normal
-            # show/hide fade for the rest of its life.
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(enable), ctypes.sizeof(enable)
-            )
+            # One window's restore failing (either call - unlikely, but
+            # these are raw Win32 calls with no guarantee) shouldn't skip
+            # restoring the *other* one, same reasoning as
+            # _hide_for_capture()'s per-window bookkeeping.
+            try:
+                hwnd = int(w.winId())
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                # Re-enable transitions for this window afterward - the
+                # force-disable in _hide_for_capture() is only meant to
+                # cover this one capture, not to permanently strip this
+                # window's normal show/hide fade for the rest of its life.
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(enable), ctypes.sizeof(enable)
+                )
+            except Exception as exc:
+                print(f"[roi_crop] failed to restore a hidden window: {exc}")
 
     def _grab_screenshot(self):
         """One-off dxcam grab matching the currently-configured capture
@@ -276,7 +304,10 @@ class RoiCropDialog:
 
         ensure_dpi_aware()
         capture_cfg = settings_store.load().get("capture", {})
-        window_title = capture_cfg.get("window_title", "").strip()
+        if self._window_title_override is not None:
+            window_title = self._window_title_override.strip()
+        else:
+            window_title = capture_cfg.get("window_title", "").strip()
 
         if self._capture_worker is not None:
             camera_width, camera_height = self._capture_worker.width, self._capture_worker.height
