@@ -1,0 +1,5 @@
+# PyGObject is usually provided by the OS on SteamOS/Arch, not pip.
+# Install with pacman/SteamOS packages if gi.repository is missing.
+
+# Required by proto/chrome_screen_ai_pb2.py for Chrome Screen AI OCR output parsing.
+protobuf>=7.35.1

@@ -1,0 +1,56 @@
+{
+  "title": "Enigma of Fear",
+  "context": "A paranormal investigation adventure in the Paranormal Order universe. Mia, an Ordo Realitas investigator, is searching for her missing father, Mr. Verity, in the Perimeter, a place known as the place that does not exist. Lupi accompanies Mia, and Samuel Norte and Agatha Volkomenn assist the investigation.",
+  "translation_policy": [
+    "Use this profile only to choose natural wording, pronouns, names, and tone.",
+    "Do not add lore or information that is not present in the source line.",
+    "If OCR text is obviously partial, translate only the readable part without inventing the missing words.",
+    "If the speaker is unknown, keep the translation neutral and avoid strongly gendered first-person pronouns.",
+    "Avoid unrelated nouns, character names, or world terms unless they appear in the source text or are clearly required by context."
+  ],
+  "terms": {
+    "Ordo Realitas": "Keep as a proper noun.",
+    "Lupi": "Dog's name. Keep in Latin letters unless a Japanese rendering is intentionally chosen.",
+    "Verity": "Proper name. Keep in Latin letters unless a Japanese rendering is intentionally chosen.",
+    "Mr. Verity": "Mia's father and the leader of Ordo Realitas. Keep as Mr. Verity or translate as Verity depending on context.",
+    "Perimeter": "A location known as the place that does not exist."
+  },
+  "characters": {
+    "MIA": {
+      "name": "Mia",
+      "gender": "female",
+      "role": "Protagonist. Paranormal investigator from Ordo Realitas. Daughter of Mr. Verity. Lupi's companion.",
+      "voice_ja": "若い女性。勇敢で親しみやすい。基本は自然な女性寄りの口調。一人称は迷う場合「私」。強すぎる男言葉の「俺」は避ける。"
+    },
+    "SAMUEL": {
+      "name": "Samuel Norte",
+      "gender": "male",
+      "role": "Hacker and paranormal investigator. Friend and ally of Mia and Lupi. Also called Sam.",
+      "voice_ja": "若い男性。くだけた、友好的で軽い口調。一人称は必要なら「俺」または文脈により省略。乱暴すぎない。"
+    },
+    "SAM": {
+      "alias_for": "SAMUEL"
+    },
+    "AGATHA": {
+      "name": "Agatha Volkomenn",
+      "gender": "female",
+      "role": "Occultism specialist and support agent assisting Mia.",
+      "voice_ja": "若い女性。知識があり落ち着いた口調。必要以上に堅くしない。"
+    },
+    "LUPI": {
+      "name": "Lupi",
+      "gender": "unknown",
+      "role": "Mia's dog. Cheerful and loyal, but fearful in paranormal situations.",
+      "voice_ja": "犬の鳴き声や短い反応は自然な日本語の擬音・短文にする。"
+    },
+    "MR. VERITY": {
+      "name": "Mr. Verity",
+      "gender": "male",
+      "role": "Mia's father and leader of Ordo Realitas.",
+      "voice_ja": "成人男性。落ち着いた指導者寄りの口調。"
+    },
+    "VERITY": {
+      "alias_for": "MR. VERITY"
+    }
+  }
+}

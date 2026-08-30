@@ -1,0 +1,40 @@
+{
+  "ocr_regions": [
+    {
+      "name": "speaker_left",
+      "role": "speaker",
+      "x_pct": 9.7,
+      "y_pct": 22.0,
+      "width_pct": 40.0,
+      "height_pct": 16.0,
+      "psm": 7,
+      "oem": 1,
+      "resize": 250,
+      "white_text_threshold": 150
+    },
+    {
+      "name": "speaker_right",
+      "role": "speaker",
+      "x_pct": 50.0,
+      "y_pct": 22.0,
+      "width_pct": 40.0,
+      "height_pct": 16.0,
+      "psm": 7,
+      "oem": 1,
+      "resize": 250,
+      "white_text_threshold": 150
+    },
+    {
+      "name": "main_text",
+      "role": "text",
+      "x_pct": 5.0,
+      "y_pct": 40.0,
+      "width_pct": 83.0,
+      "height_pct": 51.0,
+      "psm": 6,
+      "oem": 1,
+      "resize": 250,
+      "white_text_threshold": 150
+    }
+  ]
+}
