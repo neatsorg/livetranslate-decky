@@ -356,6 +356,19 @@ class RoiCropDialog:
 
     def _save(self, enable):
         capture_cfg = self.settings.setdefault("capture", {})
+        # Also persist window_title_override here, not just use it for the
+        # screenshot preview - confirmed live 2026-08-30: this dialog saves
+        # immediately on its own Save/Save-and-enable, independent of the
+        # parent Settings dialog's own OK/Cancel (same as Keybindings' own
+        # independent save). Without this, picking a new target window in
+        # Settings, opening this dialog (which correctly previews *that*
+        # window and computes fixed_roi's percentages against it), saving,
+        # then Cancelling Settings left window_title on disk as the *old*
+        # target - fixed_roi's percentages, chosen by looking at the new
+        # window, would silently crop the wrong region against whatever the
+        # old target's window shape happens to be.
+        if self._window_title_override is not None:
+            capture_cfg["window_title"] = self._window_title_override.strip()
         # Plain "Save" (enable=False) should update the rectangle if fixed
         # ROI is already the active mode, but not be the thing that flips it
         # on from disabled - that's what the separate "Save and enable"

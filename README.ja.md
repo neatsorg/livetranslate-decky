@@ -11,7 +11,7 @@ AIコーディングを使用しています。他のコードを流用した部
 ## はじめに
 
 - **[Windows版](docs/WINDOWS.ja.md)** - スタンドアロンアプリです。Python不要。
-- **Steam Deck / Linux版** - [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) 用プラグインです。Gamescope/PipeWire経由で画面をキャプチャします。多くの機能は実機のDeckでなくても、標準的なLinux環境で動作します。(このブランチはWindows版とのマージ作業中のため、Linux版の最新のインストール手順は`main`ブランチを参照してください。)
+- **[Steam Deck / Linux版](docs/LINUX.ja.md)** - [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) 用プラグインです。Gamescope/PipeWire経由で画面をキャプチャします。多くの機能は実機のDeckでなくても、標準的なLinux環境で動作します。
 
 ## 機能
 
@@ -27,7 +27,7 @@ AIコーディングを使用しています。他のコードを流用した部
 ## 開発
 
 - Windows版: [docs/BUILDING_WINDOWS.md](docs/BUILDING_WINDOWS.md) を参照(英語)
-- Steam Deck / Linux版: `main`ブランチの`docs/BUILDING.md`を参照
+- Steam Deck / Linux版: [docs/BUILDING.md](docs/BUILDING.md) を参照(英語)
 
 ## サポート
 

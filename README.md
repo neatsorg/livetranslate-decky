@@ -14,11 +14,9 @@ from using it.
 ## Get started
 
 - **[Windows](docs/WINDOWS.md)** - a standalone app, no Python required
-- **Steam Deck / Linux** - a [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)
+- **[Steam Deck / Linux](docs/LINUX.md)** - a [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)
   plugin, capturing the screen through Gamescope/PipeWire. Most features
-  also work on a standard Linux setup, not just a real Deck. (This branch
-  is mid-merge with the Windows port - see `main` for the current Linux
-  install instructions until that lands.)
+  also work on a standard Linux setup, not just a real Deck.
 
 ## Features
 
@@ -44,7 +42,7 @@ from using it.
 ## Development
 
 - Windows: see [docs/BUILDING_WINDOWS.md](docs/BUILDING_WINDOWS.md)
-- Steam Deck / Linux: see `docs/BUILDING.md` on `main`
+- Steam Deck / Linux: see [docs/BUILDING.md](docs/BUILDING.md)
 
 ## Support
 
