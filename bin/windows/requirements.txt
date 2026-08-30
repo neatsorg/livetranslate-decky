@@ -1,0 +1,15 @@
+# Runtime dependencies for the Windows tray app (bin/windows/).
+# translate_server.py and providers/ use only the stdlib (urllib, http.server) -
+# no extra packages needed for the translation backend itself.
+#
+# Pinned to the exact versions confirmed working live on the win10 test
+# laptop (2026-08-28) rather than left open - notably dxcam: the latest
+# release on PyPI (0.3.0) requires Python >=3.10, but this port was built
+# and tested against Python 3.9 with dxcam 0.0.5, which is what actually
+# works with this code today. Bump deliberately, not by accident.
+
+PySide6==6.9.1      # Qt bindings for the tray icon, HUD overlay, and settings UI. LGPLv3 - see THIRD_PARTY_LICENSES.md
+pywin32==310        # win32gui/win32api/win32event/win32process for window discovery, single-instance lock, run_hidden.py
+dxcam==0.0.5        # Desktop Duplication API screen capture. Pulls in numpy + comtypes.
+winrt-Windows.Media.Ocr==3.2.1           # Windows.Media.Ocr - the only OCR engine this port uses (see settings_store.py)
+winrt-Windows.Security.Cryptography==3.2.1  # CryptographicBuffer, used to hand SoftwareBitmap pixel data to Windows.Media.Ocr

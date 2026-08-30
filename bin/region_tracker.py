@@ -102,6 +102,7 @@ class TrackedBlock:
     stale_streak: int = 0
     settle_timestamps: list = field(default_factory=list)
     suppress_until: float = 0.0
+    created_at: float = field(default_factory=time.monotonic)
 
 
 class MultiRegionTracker:
@@ -134,6 +135,7 @@ class MultiRegionTracker:
         flaky_settle_count=3,
         flaky_window_s=10.0,
         background_pending_timeout_s=15.0,
+        max_block_age_s=None,
     ):
         self.width = width
         self.height = height
@@ -151,6 +153,9 @@ class MultiRegionTracker:
         self.flaky_settle_count = flaky_settle_count
         self.flaky_window_s = flaky_window_s
         self.background_pending_timeout_s = background_pending_timeout_s
+        # Opt-in only (None = disabled, matches every existing caller
+        # including all of Linux's - see update()'s use of this for why).
+        self.max_block_age_s = max_block_age_s
 
         self.blocks = {}  # block_id -> TrackedBlock
         self.background_points = []
@@ -224,11 +229,29 @@ class MultiRegionTracker:
         overlap_threshold=0.5,
         expand_containment_ratio=0.9,
         expand_growth_ratio=1.2,
+        force_refresh_ids=None,
     ):
         """Add newly discovered blocks that don't overlap anything already
         tracked; existing tracked blocks (baseline, armed state, current
         translation) are otherwise left untouched, with one exception (see
-        "expand" below).
+        "expand" below) plus an opt-in second exception (`force_refresh_ids`).
+
+        `force_refresh_ids`: block ids the caller already knows have no
+        usable translation right now (e.g. hidden by a pending-change event
+        that then never settled - see PipelineLoop.tick()'s discovery branch
+        on the Windows port). Without this, a block stuck `armed=False` /
+        `pending_change=True` because its content genuinely never settles
+        (e.g. continuous background animation under otherwise-static text)
+        is invisible to plain overlap-matching: it isn't "expand"-eligible
+        (same bbox, not bigger), so periodic rediscovery leaves it untouched
+        forever per the policy above, and it only recovers once
+        `block_stale_limit` finally times it out (~22s) and it gets dropped
+        + freshly re-added. `force_refresh_ids` lets a caller that already
+        knows a block's translation is missing skip that wait: same
+        re-arm/reset treatment as "expand", added to `updated` so it gets
+        retranslated on this pass. Unused by default (`None`) - existing
+        callers (Linux's capture_dynamic.py) never pass this and see no
+        behavior change.
 
         Use this for periodic/self-healing rediscovery instead of
         set_regions(). Confirmed live: full-frame OCR confidence is frame-
@@ -273,6 +296,7 @@ class MultiRegionTracker:
         """
         added = []
         updated = []
+        force_refresh_ids = force_refresh_ids or ()
         for b in discovered_blocks:
             bbox = (b["bbox"]["x0"], b["bbox"]["y0"], b["bbox"]["x1"], b["bbox"]["y1"])
             overlapping = [
@@ -300,6 +324,9 @@ class MultiRegionTracker:
                 if _containment_ratio(existing.bbox, bbox) >= expand_containment_ratio
                 and _bbox_area(bbox) >= _bbox_area(existing.bbox) * expand_growth_ratio
             ]
+            refreshable = [existing for existing in overlapping if existing.block_id in force_refresh_ids]
+            if not expandable and len(refreshable) == 1:
+                expandable = refreshable
             if len(expandable) == 1:
                 existing = expandable[0]
                 points = _sample_points(*bbox, stride=self.block_sample_stride)
@@ -316,6 +343,7 @@ class MultiRegionTracker:
                 existing.high_diff_streak = 0
                 existing.stale_streak = 0
                 existing.settle_timestamps = []
+                existing.created_at = time.monotonic()  # just re-confirmed by real discovery - reset the age clock
                 existing.suppress_until = 0.0
                 updated.append((existing.block_id, b["text"], b["conf"]))
         if added or updated:
@@ -373,6 +401,36 @@ class MultiRegionTracker:
                 block.low_diff_streak = 0
                 continue
             block.suppress_until = 0.0
+            if self.max_block_age_s is not None and now_mono - block.created_at >= self.max_block_age_s:
+                # Confirmed live 2026-08-27 (real long NORCO session): an
+                # *armed* block that never again crosses
+                # block_change_threshold has no staleness path at all - the
+                # block_stale_limit/stale_streak logic below only runs once
+                # a block is already unarmed/pending, and a block whose own
+                # sample points happen to sit on content that stays visually
+                # static forever (even as the rest of the screen moves on to
+                # a completely different scene) can just sit there holding
+                # an old translation indefinitely. Also invisible to
+                # scene_changed: _recompute_background() deliberately
+                # excludes every tracked block's own bbox from the
+                # background sample points, so a change happening *inside*
+                # an already-tracked (and now-stale) block's own area can't
+                # trigger scene_changed either - neither mechanism covers
+                # this case. This age cap is a blunt but simple backstop:
+                # drop it and let the next periodic discovery re-add it
+                # fresh (correctly, if real text is still there) or leave it
+                # gone (correctly, if it wasn't). Opt-in only
+                # (max_block_age_s=None by default) - Linux's own call
+                # sites don't pass this, so this is a no-op there unless
+                # explicitly backported and tuned for that environment too.
+                if os.environ.get("PT_DEBUG_DIFF"):
+                    print(
+                        f"[diff-debug] block={block.block_id} exceeded max_block_age_s "
+                        f"({now_mono - block.created_at:.1f}s) - dropping",
+                        flush=True,
+                    )
+                stale_block_ids.append(block.block_id)
+                continue
             if block.armed:
                 diff = _diff_ratio(block.baseline, current, self.pixel_diff_threshold)
                 if os.environ.get("PT_DEBUG_DIFF"):
