@@ -46,16 +46,18 @@ If you'd rather use it for free, please build it from source.*
 - Internet connection for downloads and for using a cloud translation
   engine
 
-## Installation from the zip
+## Installing from the zip
 
-1. Download the latest Windows version.
-2. Extract the zip anywhere you like - any folder works.
-3. Run `LiveTranslator-kun.exe` inside the extracted folder. A tray icon
+1. [Download the latest Windows version from the external distribution
+   site](https://bunkei.tech/videogame-computing-20260830-705/).
+2. Extract the downloaded zip anywhere you like - any folder works.
+3. Run `LiveTranslator-kun.exe` inside the extracted folder. If a warning
+   appears, see [Setup](#setup) below. Once the app starts, a tray icon
    appears (next to the desktop clock, or under the small "^" overflow
    arrow). Right-click it for **Settings...**, and to start/pause capture.
    Setting it up first is recommended.
 
-## Building from source
+## Building it yourself
 
 See [BUILDING_WINDOWS.md](BUILDING_WINDOWS.md) for building from source.
 
@@ -78,9 +80,11 @@ Optional, only if you plan to use them:
 
 - **A cloud API key**, if you use Gemini AI, Google Cloud Translate, or
   DeepL. Switching **Translation engine** in **Settings...** reveals each
-  engine's own API key field. The default engine (Google Translate) needs
-  no key or account at all. As the author, I'd personally recommend Google
-  Cloud Translate the most among the paid options.
+  engine's own API key field - enter it there to use that engine. See each
+  service's own help documentation for how to get a key. As the author, I'd
+  personally recommend Google Cloud Translate the most among the paid
+  options. The default engine (Google Translate) is free, so it needs no
+  key or account at all.
 - **Ollama**, if you set the translation engine to Ollama - point **URL**
   at a local or LAN Ollama server. Installing, configuring, and running
   Ollama itself is outside this app's support - please handle that
@@ -90,12 +94,12 @@ Optional, only if you plan to use them:
 
 1. The app starts paused. Right-click the tray icon and choose
    **Settings...** to open the Settings window.
-2. In **Target window title** in Settings, pick the title of the window you
-   want to translate. If nothing matches, you can type it yourself (e.g.
-   part of the game's name) - leave it blank to make the whole screen the
-   translation target. Press **Refresh list** to refresh the list of
-   currently open windows. Once the target window is set, save and close
-   Settings.
+2. In **Target window title** in Settings, pick the title of the active
+   window you want to translate. If nothing matches, you can type it
+   yourself (e.g. part of the game's name) - leave it blank to make the
+   whole screen the translation target. Press **Refresh list** to refresh
+   the list of currently open windows. Once the target window is set, save
+   and close Settings.
 3. Choose **Start Capture** from the tray menu to lift the pause and begin
    real-time translation. While it's running, that same menu item reads
    **Pause** - choosing it stops translation and clears the translated text
@@ -135,9 +139,10 @@ SmartScreen warning should let it start.
   currently paused; choose it to start real-time translation.
 - If the translation engine or the OCR engine isn't configured yet, a tray
   notification says so when the app starts. See [Setup](#setup) above to
-  configure it. Also check that **Target window title** in Settings
-  actually matches an open, non-minimized window, or is left blank to
-  capture the whole screen.
+  configure it.
+- Also check that **Target window title** in Settings actually matches a
+  window that's open and currently in the foreground (active), or is left
+  blank to capture the whole screen.
 
 **A translation engine says the API key is wrong**
 Check that the relevant key was copied correctly into Settings. Gemini,
@@ -157,6 +162,9 @@ language to re-download it.
    detected for translation.
 3. The tap-to-translate-only-what-you-tap feature that exists on the Linux
    version doesn't exist here.
+4. When several translated subtitles show up close together in a narrow
+   area, they can rarely overlap. This is close to a bug, but the practical
+   impact is minor, so it's left unfixed for now.
 
 These limitations may get addressed if enough people end up using the
 Windows version - nothing's decided yet :)
